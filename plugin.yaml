@@ -1,0 +1,5 @@
+name: tts-router
+version: 1.0.0
+description: "TTS router plugin: routes Bulgarian text to Edge TTS, everything else to OpenAI TTS. Configure as tts.provider: tts-router in config.yaml."
+author: assen.sharlandjiev
+kind: backend
