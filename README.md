@@ -50,10 +50,11 @@ tts:
   openai:
     model: Kokoro-82M-bf16           # or tts-1, tts-1-hd, etc.
     voice: af_sky
+    streaming: true
     base_url: http://127.0.0.1:8000/v1   # OpenAI-compatible endpoint
     api_key: omlx-local              # or your real OpenAI key
+    speed: 1
     response_format: opus
-    streaming: true
 ```
 
 ### Optional: Fine-tune detection
