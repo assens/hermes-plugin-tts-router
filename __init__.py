@@ -1483,10 +1483,18 @@ def _register_st_streaming_provider() -> None:
         from tools.tts_streaming import StreamingTTSProvider, register as _stream_register
 
         class BgTtsStStreamer(StreamingTTSProvider):
-            """Stream mixed BG/EN audio from the bg-tts-st server's /stream.
+            """Stream audio from the tts-router's routed backend.
 
-            Yields raw int16 mono 24 kHz PCM chunks, one per sentence, as the
-            server generates them.
+            Routes by language (mirrors ``classify_text``):
+            - Bulgarian (pure OR mixed with Latin) → bg-tts-st server's
+              ``/stream`` (Ani-Voice-API two-stage, M5 voice).
+            - English / other → delegates to the OpenAI streaming provider
+              (local Kokoro or the configured endpoint).
+
+            This ensures the Hermes streaming path (voice-mode / gateway)
+            honours the same language routing as ``synthesize()`` — otherwise
+            English-only text would incorrectly be spoken by the Bulgarian
+            voice.
             """
 
             sample_rate = 24000
@@ -1498,6 +1506,23 @@ def _register_st_streaming_provider() -> None:
                 return True
 
             def stream(self, text: str):
+                from tools.tts_streaming import OpenAIStreamer
+
+                # Route by language: only Bulgarian/mixed goes to bg-tts-st;
+                # everything else streams via OpenAI (Kokoro).
+                category = classify_text(text)
+                if category not in ("mlx", "edge"):
+                    # English / other → OpenAI streaming (Kokoro). Use the
+                    # configured openai section (model/voice/base_url/api_key).
+                    openai_section = (
+                        self.tts_config.get("openai")
+                        if isinstance(self.tts_config, dict)
+                        else None
+                    ) or {}
+                    oai = OpenAIStreamer(self.tts_config, openai_section)
+                    yield from oai.stream(text)
+                    return
+
                 server_url = (
                     self.section.get("server_url")
                     or "http://127.0.0.1:8002"
