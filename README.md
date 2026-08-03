@@ -21,12 +21,23 @@ Bulgarian route):
    lowercase text. Catches edge cases where transliterated text appears without
    Cyrillic.
 
-When Bulgarian is detected, the text is sent to **Edge TTS** using the voice
-configured in `tts.edge.voice`. Otherwise, it's sent to **OpenAI TTS** using
-the endpoint configured in `tts.openai.*`.
+When Bulgarian is detected, the text is sent to the configured Bulgarian
+backend. By default this is **bg-tts-v7** (a fine-tuned Qwen3 TTS model) via
+transformers, with **Edge TTS** as an automatic fallback. Otherwise, it's sent
+to **OpenAI TTS** using the endpoint configured in `tts.openai.*`.
 
-Each backend reads its own config block independently — both stay fully
+Each backend reads its own config block independently — all routes stay fully
 configurable.
+
+### Bulgarian backends
+
+The router supports two backends for Bulgarian text, selected via
+`tts.tts_router.bg_backend`:
+
+| Backend | Description |
+|---------|-------------|
+| `transformers` (default) | **bg-tts-v7** (Qwen3-0.6B fine-tune + MioCodec) run locally via transformers. Edge TTS is the automatic fallback on any failure. |
+| `edge` | Always Microsoft Edge neural voices (free, no heavy deps). |
 
 ## Installation
 
@@ -70,10 +81,53 @@ tts:
       - "здравей"
       - "благодаря"
       - "моля"
+    # Bulgarian backend: "transformers" (bg-tts-v7, default) or "edge"
+    bg_backend: transformers
+    # bg-tts-v7 backend options (only read when bg_backend: transformers)
+    transformers:
+      model_name: beleata74/bg-tts-v7
+      codec_model: Aratako/MioCodec-25Hz-24kHz
+      python: ~/.hermes/venvs/bg-tts/bin/python   # dedicated Python>=3.12 venv
+      preset_path: ~/.hermes/venvs/bg-tts/presets/en_female.pt
+      max_new_tokens: 500
+      temperature: 0.7
+      top_p: 0.9
+      repetition_penalty: 1.1
 ```
 
 After configuring, start a new session (`/new` or `/reset`) for the plugin to
 load.
+
+## Setting Up the bg-tts-v7 Backend
+
+The bg-tts-v7 transformers backend needs `torch`, `transformers`, and
+`miocodec`. Because `miocodec` requires **Python >= 3.12** (the Hermes runtime
+venv is Python 3.11), these run in a separate dedicated venv that the plugin
+shells out to.
+
+```bash
+# Create a Python 3.12+ venv (adjust version to what's available)
+python3.13 -m venv ~/.hermes/venvs/bg-tts
+
+# Install the stack (run with PYTHONPATH cleared so it stays self-contained)
+env -u PYTHONPATH ~/.hermes/venvs/bg-tts/bin/pip install \
+  "transformers<5" soundfile \
+  "miocodec @ git+https://github.com/Aratako/MioCodec@main" \
+  accelerate
+
+# Download a speaker preset (voice identity) — no Bulgarian one exists, so
+# we use the English female reference from MioTTS-Inference
+mkdir -p ~/.hermes/venvs/bg-tts/presets
+curl -L -o ~/.hermes/venvs/bg-tts/presets/en_female.pt \
+  https://raw.githubusercontent.com/Aratako/MioTTS-Inference/main/presets/en_female.pt
+```
+
+On the first TTS call the model (~360 MB) and codec are downloaded from the
+Hugging Face Hub automatically. Subsequent calls use the local cache.
+
+**If the backend can't load or fails for any reason, the router transparently
+falls back to Edge TTS** for Bulgarian text, so the plugin keeps working even
+before the model stack is fully set up.
 
 ## Requirements
 
