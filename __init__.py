@@ -258,6 +258,7 @@ def main():
     preset_path = cfg.get("preset_path") or os.path.expanduser(
         "~/.hermes/venvs/bg-tts/presets/en_female.pt"
     )
+    preset_path = os.path.expanduser(preset_path)  # expand ~ if config used it
     if not os.path.exists(preset_path):
         raise RuntimeError(f"speaker preset not found: {preset_path}")
     global_embedding = torch.load(preset_path, map_location=codec_device, weights_only=True)
@@ -349,6 +350,7 @@ def _generate_transformers_bg(
     python_bin = cfg.get("python") or os.path.expanduser(
         "~/.hermes/venvs/bg-tts/bin/python"
     )
+    python_bin = os.path.expanduser(python_bin)  # expand ~ if config used it
     if not os.path.exists(python_bin):
         raise RuntimeError(
             f"bg-tts venv python not found at {python_bin}. Create it with: "
@@ -422,6 +424,7 @@ def main():
     checkpoint = cfg.get("checkpoint") or os.path.expanduser(
         "~/.hermes/models/bg-tts-v5-mlx"
     )
+    checkpoint = os.path.expanduser(checkpoint)  # expand ~ if config used it
     sys.path.insert(0, checkpoint)
 
     from tts_mlx.inference import synthesize
@@ -477,6 +480,7 @@ def _generate_mlx_bg(
     python_bin = cfg.get("python") or os.path.expanduser(
         "~/.hermes/venvs/bg-tts-v5/bin/python"
     )
+    python_bin = os.path.expanduser(python_bin)  # expand ~ if config used it
     if not os.path.exists(python_bin):
         raise RuntimeError(
             f"bg-tts-v5 venv python not found at {python_bin}. Create it with: "
