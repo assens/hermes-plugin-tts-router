@@ -69,6 +69,7 @@ speech tokens → decode via MioCodec → wav).
 from __future__ import annotations
 
 import logging
+import logging.handlers
 import os
 import re
 import subprocess
@@ -775,25 +776,37 @@ class TTSRouterProvider(TTSProvider):
 
 
 def _ensure_console_handler() -> None:
-    """Attach a stderr StreamHandler to the plugin logger so routing
-    decisions always appear in the Hermes desktop console.
+    """Attach a rotating file handler so routing decisions are always logged
+    to ``~/.hermes/logs/tts-router.log``.
 
-    The plugin logger normally propagates to Hermes' root logger, but whether
-    INFO records reach the console depends on the root level/handlers, which
-    vary by launch mode. Attaching our own handler guarantees the "routed to
-    backend X" messages are visible when starting Hermes desktop.
+    The Hermes desktop console does not reliably surface INFO records from
+    plugin loggers (the root logger level/handlers vary by launch mode). Logging
+    to our own file is deterministic and survives even when the console is
+    quiet. Each routing decision is written here, so the file doubles as a
+    per-request audit trail of which backend handled each piece of text.
     """
     if logger.handlers:
         return
     logger.setLevel(logging.INFO)
-    handler = logging.StreamHandler()  # defaults to sys.stderr
+    log_dir = os.path.expanduser("~/.hermes/logs")
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, "tts-router.log")
+    handler = logging.handlers.RotatingFileHandler(
+        log_path,
+        maxBytes=5 * 1024 * 1024,  # 5 MB
+        backupCount=3,
+        encoding="utf-8",
+    )
     handler.setLevel(logging.INFO)
     handler.setFormatter(
-        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+        logging.Formatter(
+            "%(asctime)s %(levelname)s %(name)s: %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
     )
     logger.addHandler(handler)
-    # Stop propagating to the root logger to avoid double-printing when
-    # Hermes already routes this logger's records to the console.
+    # Stop propagating to the root logger — our own file is the authoritative
+    # destination for routing messages, so don't double-write to the console.
     logger.propagate = False
 
 
