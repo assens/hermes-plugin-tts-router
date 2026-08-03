@@ -1184,11 +1184,9 @@ class TTSRouterProvider(TTSProvider):
     config blocks, plus a ``tts.tts_router`` block for routing options.
 
     Bulgarian routing:
-    - ``mlx`` — pure Bulgarian text (Cyrillic, no Latin mixed in) →
-      bg-tts-v5-mlx (native Apple Silicon MLX), falling back to Edge TTS
-      on any error or missing dependency.
-    - ``edge`` — Bulgarian text mixed with Latin letters (e.g. code, brand
-      names, URLs) → Microsoft Edge neural voices.
+    - ``mlx`` / ``edge`` — pure OR mixed Bulgarian text (Cyrillic, with or
+      without Latin letters) → bg-tts-st (the Ani-Voice-API two-stage model,
+      voice=M5), falling back to Edge TTS on any error.
     - ``other`` — non-Bulgarian → OpenAI TTS.
     """
 
@@ -1258,7 +1256,7 @@ class TTSRouterProvider(TTSProvider):
 
     @property
     def display_name(self) -> str:
-        return "TTS Router (BG→MLX/Edge, Other→OpenAI)"
+        return "TTS Router (BG/Mixed→bg-tts-st, Other→OpenAI)"
 
     def is_available(self) -> bool:
         """Check that the fallback (edge) and default (openai) are importable.
@@ -1327,39 +1325,30 @@ class TTSRouterProvider(TTSProvider):
         category: str,
         tts_config: Dict[str, Any],
     ) -> str:
-        """Route Bulgarian text to the MLX / bg-tts-st / Edge backend.
+        """Route Bulgarian (pure OR mixed) text to the bg-tts-st backend.
 
         ``category`` comes from :func:`classify_text`:
-        - ``"mlx"`` — pure Bulgarian → bg-tts-v5-mlx (native Apple Silicon
-          MLX). Any failure falls back to Edge TTS.
-        - ``"edge"`` — mixed Bulgarian (Cyrillic + Latin) → bg-tts-st by
-          default (the Ani-Voice-API two-stage model handles mixed BG/EN
-          well), falling back to Edge TTS.
+        - ``"mlx"`` — pure Bulgarian (Cyrillic, no Latin).
+        - ``"edge"`` — Bulgarian with mixed Latin letters.
+
+        Both pure and mixed Bulgarian now go to **bg-tts-st** (the
+        Ani-Voice-API two-stage model with voice=M5), which handles Bulgarian
+        and mixed Bulgarian+English well. Any failure falls back to Edge TTS.
 
         ``tts_config`` is the **full** ``tts:`` config dict, passed through
         to ``_generate_edge_tts`` so the configured Bulgarian voice is
         honoured.
 
-        The ``transformers`` (bg-tts-v7) backend is intentionally **not**
-        routed to — it is kept in the codebase for testing only.
+        The ``bg-tts-v5-mlx`` and ``transformers`` (bg-tts-v7) backends are
+        intentionally **not** routed to — they are kept in the codebase for
+        testing/later re-enable, but the router no longer sends Bulgarian
+        text to them.
         """
-        if category == "mlx":
+        # Bulgarian (pure OR mixed) → bg-tts-st (voice=M5), Edge on failure.
+        if category in ("mlx", "edge"):
             try:
                 logger.info(
-                    "TTS Router: generating Bulgarian via bg-tts-v5-mlx (MLX)..."
-                )
-                return _generate_mlx_bg(text, output_path, self._mlx_cfg, format)
-            except Exception as exc:  # noqa: BLE001 — any failure falls back
-                logger.warning(
-                    "TTS Router: bg-tts-v5-mlx FAILED (%s); FALLING BACK → Edge TTS",
-                    exc,
-                )
-
-        # Mixed Bulgarian + Latin text → bg-tts-st (if configured), else Edge.
-        if category == "edge" and self._mixed_backend == "bg-tts-st":
-            try:
-                logger.info(
-                    "TTS Router: generating mixed text via bg-tts-st "
+                    "TTS Router: generating Bulgarian text via bg-tts-st "
                     "(voice=%s)...",
                     self._st_cfg.get("voice_style", "M5"),
                 )
@@ -1386,8 +1375,9 @@ class TTSRouterProvider(TTSProvider):
         """Route text to the appropriate TTS backend and synthesize.
 
         Routing (via :func:`classify_text`):
-        - ``"mlx"`` — pure Bulgarian → bg-tts-v5-mlx (MLX), Edge on failure.
-        - ``"edge"`` — mixed Bulgarian (Cyrillic + Latin) → Edge TTS.
+        - ``"mlx"`` — pure Bulgarian → bg-tts-st (voice=M5), Edge on failure.
+        - ``"edge"`` — mixed Bulgarian (Cyrillic + Latin) → bg-tts-st
+          (voice=M5), Edge on failure.
         - ``"other"`` — non-Bulgarian → OpenAI TTS (Kokoro).
 
         The ``voice`` and ``model`` params from the dispatcher are ignored —
@@ -1398,10 +1388,6 @@ class TTSRouterProvider(TTSProvider):
 
         tts_config = _load_tts_config()
         self._load_router_config(tts_config)
-        edge_block = (
-            tts_config.get("edge") if isinstance(tts_config, dict) else None
-        ) or {}
-        edge_voice = edge_block.get("voice", "DEFAULT")
 
         category = classify_text(
             text,
@@ -1410,19 +1396,11 @@ class TTSRouterProvider(TTSProvider):
         )
 
         if category in ("mlx", "edge"):
-            if category == "mlx":
-                logger.info(
-                    "TTS Router: ROUTED → bg-tts-v5-mlx (MLX)  | text='%s' (%d chars)",
-                    text, len(text),
-                )
-            else:
-                target = "bg-tts-st" if self._mixed_backend == "bg-tts-st" else "Edge TTS"
-                logger.info(
-                    "TTS Router: ROUTED → %s (voice=%s)  | text='%s' (%d chars)",
-                    target,
-                    self._st_cfg.get("voice_style", "M5") if self._mixed_backend == "bg-tts-st" else edge_voice,
-                    text, len(text),
-                )
+            logger.info(
+                "TTS Router: ROUTED → bg-tts-st (voice=%s)  | text='%s' (%d chars)",
+                self._st_cfg.get("voice_style", "M5"),
+                text, len(text),
+            )
             return self._generate_bg(
                 text, output_path, format, category, tts_config
             )
@@ -1583,9 +1561,13 @@ def _register_st_streaming_provider() -> None:
 def register(ctx) -> None:
     """Plugin entry point — wire TTSRouterProvider into the TTS registry.
 
-    Also manages the persistent bg-tts-v5-mlx and bg-tts-st server lifecycles:
-    - starts each server on plugin load (idempotent — no-op if already running)
-    - stops them when the Hermes process exits (via ``atexit``)
+    Also manages the persistent bg-tts-st server lifecycle:
+    - starts it on plugin load (idempotent — no-op if already running)
+    - stops it when the Hermes process exits (via ``atexit``)
+
+    The bg-tts-v5-mlx persistent server is no longer managed here because the
+    router no longer routes to MLX (both pure and mixed Bulgarian go to
+    bg-tts-st). MLX code/config remain in the module for later re-enable.
     """
     _ensure_console_handler()
     ctx.register_tts_provider(TTSRouterProvider())
@@ -1594,16 +1576,6 @@ def register(ctx) -> None:
     # streaming readback). Best-effort — Hermes's streaming module may not be
     # available in all contexts.
     _register_st_streaming_provider()
-
-    # Manage the persistent bg-tts-v5-mlx server.
-    try:
-        _ensure_server_running()
-        # Stop the server when the Hermes process exits.
-        if not getattr(_stop_server, "_registered", False):
-            atexit.register(_stop_server)
-            _stop_server._registered = True
-    except Exception as exc:  # noqa: BLE001 — never block plugin registration
-        logger.warning("TTS Router: server lifecycle setup failed: %s", exc)
 
     # Manage the persistent bg-tts-st (Ani-Voice-API) server.
     try:
@@ -1614,4 +1586,4 @@ def register(ctx) -> None:
     except Exception as exc:  # noqa: BLE001 — never block plugin registration
         logger.warning("TTS Router: bg-tts-st server lifecycle setup failed: %s", exc)
 
-    logger.info("TTS Router plugin registered: BG→MLX/Edge, Other→OpenAI")
+    logger.info("TTS Router plugin registered: BG/Mixed→bg-tts-st, Other→OpenAI")

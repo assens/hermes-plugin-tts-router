@@ -3,15 +3,17 @@
 A [Hermes Agent](https://github.com/NousResearch/hermes-agent) TTS plugin that
 routes text-to-speech calls based on language detection:
 
-- **Pure Bulgarian text** (Cyrillic, no Latin mixed in) → **bg-tts-v5-mlx**
-  (native Apple Silicon MLX) with automatic fallback to Edge TTS
-- **Mixed Bulgarian** (Cyrillic + Latin letters, e.g. code/brand names) →
+- **Bulgarian text** (Cyrillic, pure OR mixed with English/Latin) →
   **bg-tts-st** (Ani-Voice-API two-stage: Supertonic → BgTTS, M5 voice) with
   automatic fallback to Edge TTS
 - **Everything else** → OpenAI TTS (or any OpenAI-compatible endpoint — Kokoro, OpenAI, DeepInfra, etc.)
 
 This lets you keep a single `tts.provider: tts-router` in `config.yaml` and have
 mixed-language output routed automatically — no manual switching.
+
+> The `bg-tts-v5-mlx` and `transformers` (bg-tts-v7) backends are **not** routed
+> to — both pure and mixed Bulgarian go to bg-tts-st. The MLX/transformers code
+> and config remain in the plugin for testing / later re-enable.
 
 ## How It Works
 
@@ -25,27 +27,24 @@ Bulgarian route):
    lowercase text. Catches edge cases where transliterated text appears without
    Cyrillic.
 
-When Bulgarian is detected, it's further split into **pure** (Cyrillic only,
-no Latin letters) vs **mixed** (Cyrillic + Latin):
+When Bulgarian is detected, the whole text (pure OR mixed with Latin) routes to
+**bg-tts-st**:
 
-- **Pure Bulgarian** → `bg-tts-v5-mlx` (native Apple Silicon MLX), falling
-  back to Edge TTS on any failure.
-- **Mixed Bulgarian** (contains Latin letters — e.g. code, brand names, URLs)
-  → `bg-tts-st` (Ani-Voice-API two-stage), falling back to Edge TTS.
+- **Bulgarian (pure or mixed)** → `bg-tts-st` (Ani-Voice-API two-stage,
+  M5 voice), falling back to Edge TTS on any failure.
 - **Non-Bulgarian** → OpenAI TTS using `tts.openai.*`.
 
 Each backend reads its own config block independently — all routes stay fully
 configurable.
 
-### Bulgarian backends
+### Bulgarian backend
 
-The router routes Bulgarian to two backends (the `transformers`/bg-tts-v7
-backend is kept in the codebase for testing but **not** routed to):
+The router sends all Bulgarian text to a single backend (`transformers`/bg-tts-v7
+and `bg-tts-v5-mlx` are kept in the codebase for testing but **not** routed to):
 
 | Route | Backend | Description |
 |-------|---------|-------------|
-| Pure Bulgarian | `mlx` | **bg-tts-v5-mlx** (native Apple Silicon MLX, ~965MB model). Best quality for Bulgarian. Edge TTS is the automatic fallback on any failure. |
-| Mixed Bulgarian | `bg-tts-st` | **Ani-Voice-API** two-stage (Supertonic → BgTTS, M5 voice). Handles mixed BG/EN text well. Edge TTS is the automatic fallback on any failure. |
+| Bulgarian (pure or mixed) | `bg-tts-st` | **Ani-Voice-API** two-stage (Supertonic → BgTTS, M5 voice). Handles pure Bulgarian and mixed BG/EN text well. Edge TTS is the automatic fallback on any failure. |
 
 ## Installation
 
@@ -89,20 +88,8 @@ tts:
       - "здравей"
       - "благодаря"
       - "моля"
-    # bg-tts-v5-mlx backend options (used for pure Bulgarian text)
-    mlx:
-      checkpoint: ~/.hermes/models/bg-tts-v5-mlx   # model directory
-      python: ~/.hermes/venvs/bg-tts-v5/bin/python  # dedicated Python>=3.12 venv
-      speaker_id: 0                                 # 0=AI voice, 1=audiobook narrator
-      temperature: 0.25
-      top_k: 50
-      top_p: 0.8
-      rep_penalty: 1.1
-      max_tokens: 2000
-    # Backend for MIXED Bulgarian+English text (Cyrillic + Latin).
-    # "bg-tts-st" (default) = Ani-Voice-API two-stage; "edge" = Edge neural.
-    mixed_backend: bg-tts-st
-    # bg-tts-st (Ani-Voice-API) backend options (used for mixed text)
+    # bg-tts-st (Ani-Voice-API) backend options (used for ALL Bulgarian text —
+    # pure or mixed). This is now the single Bulgarian backend.
     bg_tts_st:
       voice_style: M5        # Supertonic voice: F1-F5 female, M1-M5 male
       speed: 1.6
@@ -113,13 +100,14 @@ tts:
       rep_penalty: 1.1
       max_new_tokens: 512
       server_url: http://127.0.0.1:8002
+    # The bg-tts-v5-mlx and transformers (bg-tts-v7) backends are kept in the
+    # codebase for testing / later re-enable but are NOT routed to.
 ```
 
-> Routing is automatic: pure Bulgarian (Cyrillic, no Latin) → `mlx`;
-> mixed Bulgarian (contains Latin letters) → `bg-tts-st`; everything else →
-> OpenAI TTS. The `transformers`/bg-tts-v7 backend is kept in the codebase
-> for testing only and is **not** part of the routing. Edge TTS is the
-> automatic fallback for both Bulgarian routes on any failure.
+> Routing is automatic: Bulgarian (pure OR mixed with Latin) → `bg-tts-st`;
+> everything else → OpenAI TTS. Edge TTS is the automatic fallback for the
+> Bulgarian route on any failure. The `transformers`/bg-tts-v7 and `mlx`
+> backends are kept in the codebase for testing only and are **not** routed to.
 
 After configuring, start a new session (`/new` or `/reset`) for the plugin to
 load.
@@ -139,18 +127,22 @@ per-request audit trail of which backend handled each piece of text:
 ```
 2026-08-03 19:26:03 INFO hermes_plugins.tts__tts_router: TTS Router: ROUTED → Edge TTS (voice=bg-BG-KalinaNeural)  | text='English: The children are playing...' (86 chars)
 2026-08-03 19:26:03 INFO hermes_plugins.tts__tts_router: TTS Router: generating Bulgarian via Edge TTS...
-2026-08-03 19:20:54 INFO hermes_plugins.tts__tts_router: TTS Router: ROUTED → bg-tts-v5-mlx (MLX)  | text='Здравей, как сте?' (16 chars)
+2026-08-03 19:20:54 INFO hermes_plugins.tts__tts_router: TTS Router: ROUTED → bg-tts-st (voice=M5)  | text='Здравей, как сте?' (16 chars)
 ```
 
-The log line for Edge routing includes the voice actually used (e.g.
-`voice=bg-BG-KalinaNeural`), and warnings are emitted whenever the MLX
-backend fails and falls back to Edge. To watch live:
+The log line for the bg-tts-st route includes the voice actually used (e.g.
+`voice=M5`), and warnings are emitted whenever the bg-tts-st backend fails
+and falls back to Edge. To watch live:
 
 ```bash
 tail -f ~/.hermes/logs/tts-router.log
 ```
 
-## Setting Up the bg-tts-v5-mlx Backend
+## Setting Up the bg-tts-v5-mlx Backend (for reference — not routed)
+
+> The router no longer sends Bulgarian text to bg-tts-v5-mlx (both pure and
+> mixed Bulgarian now go to bg-tts-st). This section is kept for reference and
+> in case you re-enable the MLX route later.
 
 The bg-tts-v5-mlx backend is a **native Apple Silicon MLX** TTS model that runs
 fully on-device. It needs its own dedicated venv (the model requires MLX, which
@@ -440,9 +432,12 @@ under the name `tts-router`. When `tts.provider: tts-router` is set in
 
 The plugin then:
 - **Routes** non-Bulgarian text to the built-in `_generate_openai_tts`
-- **Implements** the Bulgarian backends itself:
-  - `bg-tts-v5-mlx` via a dedicated MLX venv (`_generate_mlx_bg`, shells out
-    to the model's own `tts_mlx` inference module)
+- **Implements** the Bulgarian backend itself:
+  - `bg-tts-st` (Ani-Voice-API two-stage, M5 voice) — the single routed
+    Bulgarian backend (`_generate_st_bg`, via the persistent server on 8002
+    or subprocess fallback)
+  - `bg-tts-v5-mlx` via a dedicated MLX venv (`_generate_mlx_bg`, kept for
+    reference, not routed to)
   - `bg-tts-v7` via transformers (`_generate_transformers_bg`, kept for
     testing, not routed to)
   - Edge TTS via the built-in `_generate_edge_tts`, passing the full tts
