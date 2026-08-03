@@ -675,13 +675,15 @@ class TTSRouterProvider(TTSProvider):
         self,
         text: str,
         output_path: str,
-        edge_config: Dict[str, Any],
+        tts_config: Dict[str, Any],
     ) -> str:
         """Synthesize via Microsoft Edge neural voices.
 
-        ``edge_config`` is the ``tts.edge`` block (e.g. ``voice:
-        bg-BG-KalinaNeural``). Passing it through ensures the configured
-        Bulgarian voice is used rather than the default English voice.
+        ``tts_config`` is the **full** ``tts:`` config dict (which contains
+        the ``edge`` block). ``_generate_edge_tts`` internally reads
+        ``tts_config.get("edge").voice`` to pick the voice, so the whole
+        config must be passed through — not just the ``edge`` sub-block,
+        otherwise it falls back to the default English voice.
         """
         from tools.tts_tool import _generate_edge_tts
 
@@ -693,11 +695,11 @@ class TTSRouterProvider(TTSProvider):
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 pool.submit(
                     lambda: asyncio.run(
-                        _generate_edge_tts(text, output_path, edge_config)
+                        _generate_edge_tts(text, output_path, tts_config)
                     )
                 ).result(timeout=60)
         except RuntimeError:
-            asyncio.run(_generate_edge_tts(text, output_path, edge_config))
+            asyncio.run(_generate_edge_tts(text, output_path, tts_config))
         return output_path
 
     def _generate_bg(
@@ -706,7 +708,7 @@ class TTSRouterProvider(TTSProvider):
         output_path: str,
         format: str,
         category: str,
-        edge_config: Dict[str, Any],
+        tts_config: Dict[str, Any],
     ) -> str:
         """Route Bulgarian text to the MLX model or Edge TTS.
 
@@ -715,8 +717,9 @@ class TTSRouterProvider(TTSProvider):
           MLX). Any failure falls back to Edge TTS.
         - ``"edge"`` — mixed Bulgarian (Cyrillic + Latin) → Edge TTS.
 
-        ``edge_config`` is the ``tts.edge`` block passed to the Edge TTS
-        backend so the configured Bulgarian voice is honoured.
+        ``tts_config`` is the **full** ``tts:`` config dict, passed through
+        to ``_generate_edge_tts`` so the configured Bulgarian voice is
+        honoured.
 
         The ``transformers`` (bg-tts-v7) backend is intentionally **not**
         routed to — it is kept in the codebase for testing only.
@@ -733,7 +736,7 @@ class TTSRouterProvider(TTSProvider):
                     exc,
                 )
 
-        return self._generate_edge(text, output_path, edge_config)
+        return self._generate_edge(text, output_path, tts_config)
 
     def synthesize(
         self,
@@ -761,9 +764,10 @@ class TTSRouterProvider(TTSProvider):
 
         tts_config = _load_tts_config()
         self._load_router_config(tts_config)
-        edge_config = (
+        edge_block = (
             tts_config.get("edge") if isinstance(tts_config, dict) else None
         ) or {}
+        edge_voice = edge_block.get("voice", "DEFAULT")
 
         category = classify_text(
             text,
@@ -778,13 +782,12 @@ class TTSRouterProvider(TTSProvider):
                     text, len(text),
                 )
             else:
-                voice = edge_config.get("voice", "DEFAULT")
                 logger.info(
                     "TTS Router: ROUTED → Edge TTS (voice=%s)  | text='%s' (%d chars)",
-                    voice, text, len(text),
+                    edge_voice, text, len(text),
                 )
             return self._generate_bg(
-                text, output_path, format, category, edge_config
+                text, output_path, format, category, tts_config
             )
 
         logger.info(
