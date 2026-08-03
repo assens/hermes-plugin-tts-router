@@ -719,7 +719,7 @@ class TTSRouterProvider(TTSProvider):
                 return _generate_mlx_bg(text, output_path, self._mlx_cfg, format)
             except Exception as exc:  # noqa: BLE001 — any failure falls back
                 logger.warning(
-                    "TTS Router: bg-tts-v5-mlx failed (%s); falling back to Edge TTS",
+                    "TTS Router: bg-tts-v5-mlx FAILED (%s); FALLING BACK → Edge TTS",
                     exc,
                 )
 
@@ -760,17 +760,41 @@ class TTSRouterProvider(TTSProvider):
 
         if category in ("mlx", "edge"):
             logger.info(
-                "TTS Router: Bulgarian text detected (%d chars, %s)",
-                len(text), category,
+                "TTS Router: ROUTED → %s  | text='%s' (%d chars)",
+                "bg-tts-v5-mlx (MLX)" if category == "mlx" else "Edge TTS",
+                text, len(text),
             )
             return self._generate_bg(text, output_path, format, category)
 
         logger.info(
-            "TTS Router: non-Bulgarian text (%d chars), routing to OpenAI TTS",
-            len(text),
+            "TTS Router: ROUTED → OpenAI TTS (Kokoro)  | text='%s' (%d chars)",
+            text, len(text),
         )
         _generate_openai_tts(text, output_path, tts_config)
         return output_path
+
+
+def _ensure_console_handler() -> None:
+    """Attach a stderr StreamHandler to the plugin logger so routing
+    decisions always appear in the Hermes desktop console.
+
+    The plugin logger normally propagates to Hermes' root logger, but whether
+    INFO records reach the console depends on the root level/handlers, which
+    vary by launch mode. Attaching our own handler guarantees the "routed to
+    backend X" messages are visible when starting Hermes desktop.
+    """
+    if logger.handlers:
+        return
+    logger.setLevel(logging.INFO)
+    handler = logging.StreamHandler()  # defaults to sys.stderr
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    )
+    logger.addHandler(handler)
+    # Stop propagating to the root logger to avoid double-printing when
+    # Hermes already routes this logger's records to the console.
+    logger.propagate = False
 
 
 # ---------------------------------------------------------------------------
@@ -780,5 +804,6 @@ class TTSRouterProvider(TTSProvider):
 
 def register(ctx) -> None:
     """Plugin entry point — wire TTSRouterProvider into the TTS registry."""
+    _ensure_console_handler()
     ctx.register_tts_provider(TTSRouterProvider())
-    logger.info("TTS Router plugin registered: BG→bg-tts-v7/Edge, Other→OpenAI")
+    logger.info("TTS Router plugin registered: BG→MLX/Edge, Other→OpenAI")
