@@ -7,11 +7,12 @@ backend in isolation — useful for experimenting with the model without going
 through the tts-router (this tool does NOT touch routing).
 
 It shells out to the dedicated bg-tts venv (Python >= 3.12, torch +
-transformers + miocodec) and synthesizes ``text`` to an audio file.
+transformers + miocodec), synthesizes ``text`` to a temp wav, plays it with
+ffplay, and deletes the temp file.
 
 Usage
 -----
-    ~/.hermes/scripts/bg_tts_v7_cli.py "Текст за синтез" [-o out.wav] [options]
+    ~/.hermes/scripts/bg_tts_v7_cli.py "Текст за синтез" [options]
 
 Options mirror the transformers config block from the tts-router plugin.
 """
@@ -159,11 +160,6 @@ def main():
                     "in isolation (does not touch tts-router routing).",
     )
     parser.add_argument("text", nargs="?", help="Bulgarian text to synthesize")
-    parser.add_argument("-o", "--output", default=None,
-                        help="Output audio path. If omitted, a temp file is "
-                             "created and its path printed.")
-    parser.add_argument("--format", default="wav", choices=["wav", "mp3"],
-                        help="Output format (default: wav)")
     parser.add_argument("--python", default=DEFAULT_VENV,
                         help="Path to the bg-tts venv python (default: the "
                              "dedicated ~/.hermes/venvs/bg-tts/bin/python)")
@@ -191,23 +187,18 @@ def main():
     if not args.text:
         parser.error("text argument is required (e.g. bg_tts_v7_cli.py \"Здравей\")")
 
-    # Determine output path.
-    output_path = args.output
-    if output_path:
-        output_path = os.path.expanduser(output_path)
-    else:
-        import tempfile
-        suffix = ".wav" if args.format == "wav" else ".mp3"
-        fd, output_path = tempfile.mkstemp(suffix=suffix, prefix="bg-tts-v7-")
-        os.close(fd)
-        os.unlink(output_path)  # worker writes it
+    # Generate to a temp wav file, play it with ffplay, then delete it.
+    import tempfile
+    fd, output_path = tempfile.mkstemp(suffix=".wav", prefix="bg-tts-v7-")
+    os.close(fd)
+    os.unlink(output_path)  # worker writes it
 
     cfg = build_cfg(args)
     opts = {
         "text": args.text,
         "output_path": output_path,
         "cfg": cfg,
-        "format": args.format,
+        "format": "wav",
     }
 
     python_bin = os.path.expanduser(args.python)
@@ -250,13 +241,10 @@ def main():
         sys.exit(1)
 
     out = result.get("output_path") or output_path
-    size = os.path.getsize(out) if os.path.exists(out) else 0
-    print(f"OK: {out} ({size} bytes)")
 
-    # Try to report duration.
+    # Report duration.
     try:
-        import subprocess as sp
-        dur = sp.run(
+        dur = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration",
              "-of", "csv=p=0", out],
             capture_output=True, text=True,
@@ -265,6 +253,24 @@ def main():
             print(f"Duration: {dur}s")
     except Exception:
         pass
+
+    # Play the audio with ffplay, then clean up the temp file.
+    print("Playing audio...")
+    try:
+        subprocess.run(["ffplay", "-nodisp", "-autoexit", "-loglevel", "error", out],
+                       check=True)
+    except FileNotFoundError:
+        print("ERROR: ffplay not found (install ffmpeg with the ffplay binary). "
+              f"Generated audio left at: {out}")
+        sys.exit(1)
+    except subprocess.CalledProcessError as exc:
+        print(f"WARNING: ffplay exited with code {exc.returncode}")
+    finally:
+        try:
+            os.unlink(out)
+        except OSError:
+            pass
+    print("Done.")
 
 
 if __name__ == "__main__":

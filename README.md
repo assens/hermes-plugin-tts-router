@@ -241,10 +241,11 @@ before the model stack is fully set up.
 ### Testing the bg-tts-v7 backend with the CLI
 
 To experiment with the transformers model in isolation (without going through
-the router), use the bundled test CLI:
+the router), use the bundled test CLI. It synthesizes the text and **plays it
+back with ffplay** (no file is saved):
 
 ```bash
-~/.hermes/scripts/bg_tts_v7_cli.py "Здравейте, как сте днес?" -o out.wav
+~/.hermes/scripts/bg_tts_v7_cli.py "Здравейте, как сте днес?"
 ```
 
 It shells out to the same `bg-tts` venv and synthesis logic the plugin's
@@ -252,7 +253,6 @@ It shells out to the same `bg-tts` venv and synthesis logic the plugin's
 pure test harness. Options mirror the transformers config block:
 
 ```bash
-~/.hermes/scripts/bg_tts_v7_cli.py "Текст" --format mp3           # mp3 output
 ~/.hermes/scripts/bg_tts_v7_cli.py "Текст" --temperature 0.9      # sampling
 ~/.hermes/scripts/bg_tts_v7_cli.py "Текст" --max-new-tokens 800   # length
 ~/.hermes/scripts/bg_tts_v7_cli.py --help                          # all options
