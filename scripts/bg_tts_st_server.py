@@ -21,6 +21,10 @@ Endpoints
                               "temperature": 0.7, "top_k": 250, "top_p": 0.95,
                               "rep_penalty": 1.1, "max_new_tokens": 512}
                    returns audio bytes (wav, 24000 Hz).
+- POST /stream  -> same body; returns NDJSON (chunked), one line per sentence
+                   as it's generated: {"chunk_index": i, "pcm_base64": "...",
+                   "duration": 0.0} where pcm_base64 is raw little-endian
+                   int16 mono 24 kHz PCM (for streaming playback).
 - POST /shutdown -> graceful stop.
 
 Idle unload: the model is freed after ``idle_timeout`` seconds (default 300 =
@@ -193,6 +197,119 @@ class TTSState:
 
         return wav_bytes, float(dur)
 
+    def synthesize_stream(self, text, voice_style=None, speed=None,
+                          temperature=0.7, top_k=250, top_p=0.95,
+                          rep_penalty=1.1, max_new_tokens=512):
+        """Synthesize text -> raw PCM chunks (int16, 24 kHz mono), sentence by
+        sentence.
+
+        Splits ``text`` into sentences and yields ``(pcm_bytes, duration_s)``
+        for each as it's generated. This is what enables "hear-as-generated"
+        playback — the client gets each sentence the moment it's ready instead
+        of waiting for the whole response.
+
+        Each yielded chunk is raw little-endian int16 mono PCM at 24 kHz
+        (the BgTTS output format), ready for the streaming-TTS provider
+        contract.
+        """
+        import io
+        import re
+        import tempfile
+        import wave
+
+        import numpy as np
+
+        from inference import synthesize as bgtts_synthesize
+        from normalizer import normalize_text
+
+        voice_style = voice_style or self.default_voice_style
+        speed = speed if speed is not None else self.default_speed
+
+        # Split into sentence chunks (mirror tts_engine.split_text_for_tts).
+        def _split(text):
+            text = text.strip()
+            if not text:
+                return []
+            raw = re.split(r"(?<=[.!?…])\s+|\n+", text)
+            chunks, buf = [], ""
+            for part in raw:
+                part = part.strip()
+                if not part:
+                    continue
+                if not buf or len(buf) < 80 or len(buf) + len(part) + 1 <= 200:
+                    buf = (buf + " " + part).strip()
+                else:
+                    chunks.append(buf)
+                    buf = part
+            if buf:
+                chunks.append(buf)
+            return chunks
+
+        # Supertonic reference (one per request; the voice identity).
+        v_style = self.supertonic.get_voice_style(voice_name=voice_style)
+        clean_text = text.replace('"', '').replace('„', '').replace('“', '') \
+                         .replace("\u2019", "'").replace("\u2013", "-").replace("\u2014", "-") \
+                         .replace("*", "")
+        if not clean_text.strip():
+            return
+
+        wav_array, _ = self.supertonic.synthesize(
+            clean_text, voice_style=v_style, lang="bg", speed=speed
+        )
+        wav_data = np.asarray(wav_array).flatten()
+        wav_max = np.max(np.abs(wav_data))
+        if wav_max > 0:
+            wav_data = wav_data / wav_max
+        pcm = (wav_data * 32767).astype(np.int16)
+
+        fd, ref_path = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+        try:
+            with wave.open(ref_path, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(44100)
+                wf.writeframes(pcm.tobytes())
+
+            normalized = normalize_text(clean_text)
+            for chunk in _split(normalized):
+                if not chunk.strip():
+                    continue
+                fd2, final_path = tempfile.mkstemp(suffix=".wav")
+                os.close(fd2)
+                os.unlink(final_path)
+                try:
+                    bgtts_synthesize(
+                        checkpoint=self._bgtts_checkpoint,
+                        text=chunk,
+                        output=final_path,
+                        speaker_wav=ref_path,
+                        device="mps",
+                        temperature=float(temperature),
+                        top_k=int(top_k),
+                        top_p=float(top_p),
+                        rep_penalty=float(rep_penalty),
+                        max_tokens=int(max_new_tokens),
+                    )
+                    if not os.path.exists(final_path) or os.path.getsize(final_path) == 0:
+                        raise RuntimeError("BgTTS produced no audio output")
+                    # Convert wav -> raw PCM (int16 mono 24kHz).
+                    with wave.open(final_path, "rb") as wf:
+                        nframes = wf.getnframes()
+                        sr = wf.getframerate()
+                        raw_pcm = wf.readframes(nframes)
+                    yield raw_pcm, nframes / sr
+                finally:
+                    try:
+                        os.remove(final_path)
+                    except OSError:
+                        pass
+        finally:
+            try:
+                os.remove(ref_path)
+            except OSError:
+                pass
+
     # -- idle unload loop ---------------------------------------------
     def idle_loop(self, stop_event):
         while not stop_event.is_set():
@@ -251,9 +368,12 @@ def main():
                 ), daemon=True).start()
                 self._send_json(200, {"status": "shutting down"})
                 return
-            if self.path.split("?")[0] != "/tts":
+
+            path = self.path.split("?")[0]
+            if path not in ("/tts", "/stream"):
                 self._send_json(404, {"error": "not found"})
                 return
+
             try:
                 length = int(self.headers.get("Content-Length", 0))
                 body = json.loads(self.rfile.read(length) or b"{}")
@@ -279,6 +399,51 @@ def main():
                     self._send_json(500, {"error": "model not loaded"})
                     return
                 t0 = time.time()
+
+                if path == "/stream":
+                    # Streaming: yield one NDJSON line per sentence chunk as
+                    # it's generated (base64-encoded raw PCM, 24 kHz mono).
+                    # Each line: {"chunk_index": i, "pcm_base64": "...",
+                    #             "duration": 0.0}
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/x-ndjson")
+                    self.send_header("Transfer-Encoding", "chunked")
+                    self.end_headers()
+                    import base64 as _b64
+                    idx = 0
+                    try:
+                        for pcm_bytes, dur in state.synthesize_stream(text, **opts):
+                            line = json.dumps({
+                                "chunk_index": idx,
+                                "pcm_base64": _b64.b64encode(pcm_bytes).decode("utf-8"),
+                                "duration": round(dur, 3),
+                            }) + "\n"
+                            payload = line.encode("utf-8")
+                            self.wfile.write(f"{len(payload):X}\r\n".encode("utf-8"))
+                            self.wfile.write(payload)
+                            self.wfile.write(b"\r\n")
+                            self.wfile.flush()
+                            idx += 1
+                            print(f"  ➤ chunk {idx-1}: {dur:.2f}s PCM "
+                                  f"({len(pcm_bytes)} bytes)", flush=True)
+                        self.wfile.write(b"0\r\n\r\n")  # chunked terminator
+                        self.wfile.flush()
+                    except Exception as exc:  # noqa: BLE001
+                        # Terminate the chunked stream on error.
+                        try:
+                            err_line = (json.dumps({"error": str(exc)}) + "\n").encode("utf-8")
+                            self.wfile.write(f"{len(err_line):X}\r\n".encode("utf-8"))
+                            self.wfile.write(err_line)
+                            self.wfile.write(b"\r\n")
+                            self.wfile.write(b"0\r\n\r\n")
+                            self.wfile.flush()
+                        except Exception:  # noqa: BLE001
+                            pass
+                    print(f"✅ {text[:40]!r} -> {idx} streamed chunks "
+                          f"({time.time()-t0:.2f}s)", flush=True)
+                    return
+
+                # Whole-file /tts path.
                 try:
                     wav_bytes, dur = state.synthesize(text, **opts)
                 except Exception as exc:  # noqa: BLE001

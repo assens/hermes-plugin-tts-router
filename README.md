@@ -251,6 +251,37 @@ The server:
 The tts-router **tries the bg-tts-st server first**, falling back to the
 subprocess-per-request path if it's not running, and to Edge TTS if both fail.
 
+#### Streaming (`/stream`)
+
+The server also exposes a **streaming endpoint** for "hear-as-generated"
+playback. It returns per-sentence audio chunks as NDJSON (HTTP chunked), one
+line per sentence as each is generated:
+
+```bash
+curl -sN -X POST http://127.0.0.1:8002/stream \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Здравейте! Това е първото изречение. Ето второто.", "voice_style": "M5"}'
+```
+
+Each NDJSON line is `{"chunk_index": i, "pcm_base64": "...", "duration": 0.0}`
+where `pcm_base64` is **raw little-endian int16 mono 24 kHz PCM** — ready for
+streaming playback without any conversion.
+
+The tts-router plugin **registers a streaming provider** (under the name
+`tts-router`) with Hermes's streaming-TTS machinery, so Hermes's voice-mode /
+gateway streaming path (`stream_tts_to_speaker`, `StreamingTTSConsumer`) can
+read back mixed BG/EN audio while it's being generated.
+
+> **Note:** This unlocks streaming for Hermes's **voice-mode / gateway**
+> streaming path. It does **not** change the desktop *typed-text* flow, which
+> synthesizes the whole response as a file after the LLM finishes generating.
+
+#### Streaming sample-rate detail
+
+BgTTS synthesizes at 24 kHz (mono, int16). The streaming provider advertises
+`sample_rate=24000, channels=1, sample_width=2` so Hermes's playback layer
+opens the correct sounddevice stream (or writes an accurate temp WAV).
+
 ## Setting Up the bg-tts-v7 Backend (Alternative)
 
 The bg-tts-v7 transformers backend needs `torch`, `transformers`, and

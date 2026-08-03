@@ -1471,6 +1471,111 @@ def _ensure_console_handler() -> None:
 
 
 # ---------------------------------------------------------------------------
+# bg-tts-st streaming provider (for Hermes streaming TTS / voice mode)
+# ---------------------------------------------------------------------------
+#
+# Registers a StreamingTTSProvider named "tts-router" so that Hermes's
+# streaming-TTS machinery (stream_tts_to_speaker / StreamingTTSConsumer) can
+# read back mixed BG/EN audio while it's being generated. The provider reads
+# the bg-tts-st server's /stream endpoint, which yields per-sentence raw PCM
+# (int16 mono 24 kHz) chunks. Registering under "tts-router" means
+# resolve_streaming_provider() picks it up automatically since
+# tts.provider == "tts-router".
+#
+# Note: this unlocks streaming for Hermes's voice-mode / gateway streaming
+# path. It does NOT change the desktop typed-text flow (which synthesizes
+# the whole response as a file after the LLM finishes).
+
+def _register_st_streaming_provider() -> None:
+    """Register a bg-tts-st streaming provider with Hermes, if possible.
+
+    Idempotent (guarded by a module flag). Never raises — if the Hermes
+    streaming module isn't importable (e.g. running standalone), we just
+    skip registration.
+    """
+    if getattr(_register_st_streaming_provider, "_done", False):
+        return
+    _register_st_streaming_provider._done = True
+    try:
+        import base64 as _b64
+        import json as _json
+        import urllib.request as _urlreq
+        import urllib.error as _urlerr
+
+        from tools.tts_streaming import StreamingTTSProvider, register as _stream_register
+
+        class BgTtsStStreamer(StreamingTTSProvider):
+            """Stream mixed BG/EN audio from the bg-tts-st server's /stream.
+
+            Yields raw int16 mono 24 kHz PCM chunks, one per sentence, as the
+            server generates them.
+            """
+
+            sample_rate = 24000
+            channels = 1
+            sample_width = 2
+
+            @staticmethod
+            def available() -> bool:
+                return True
+
+            def stream(self, text: str):
+                server_url = (
+                    self.section.get("server_url")
+                    or "http://127.0.0.1:8002"
+                ).rstrip("/")
+                voice_style = self.section.get("voice_style", "M5")
+                speed = float(self.section.get("speed", 1.6))
+                temperature = float(self.section.get("temperature", 0.7))
+                top_k = int(self.section.get("top_k", 250))
+                top_p = float(self.section.get("top_p", 0.95))
+                rep_penalty = float(self.section.get("rep_penalty", 1.1))
+                max_new_tokens = int(self.section.get("max_new_tokens", 512))
+
+                payload = _json.dumps({
+                    "text": text,
+                    "voice_style": voice_style,
+                    "speed": speed,
+                    "temperature": temperature,
+                    "top_k": top_k,
+                    "top_p": top_p,
+                    "rep_penalty": rep_penalty,
+                    "max_new_tokens": max_new_tokens,
+                }).encode("utf-8")
+
+                req = _urlreq.Request(
+                    f"{server_url}/stream",
+                    data=payload,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                try:
+                    resp = _urlreq.urlopen(req, timeout=300)
+                except _urlerr.URLError as exc:
+                    raise RuntimeError(f"bg-tts-st stream unavailable: {exc}") from exc
+
+                with resp:
+                    for line in resp:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            obj = _json.loads(line)
+                        except _json.JSONDecodeError:
+                            continue
+                        if "error" in obj:
+                            raise RuntimeError(f"bg-tts-st stream error: {obj['error']}")
+                        pcm = _b64.b64decode(obj["pcm_base64"])
+                        if pcm:
+                            yield pcm
+
+        _stream_register("tts-router")(BgTtsStStreamer)
+        logger.info("TTS Router: registered bg-tts-st streaming provider 'tts-router'")
+    except Exception as exc:  # noqa: BLE001 — streaming is optional
+        logger.warning("TTS Router: could not register streaming provider: %s", exc)
+
+
+# ---------------------------------------------------------------------------
 # Plugin entry point
 # ---------------------------------------------------------------------------
 
@@ -1484,6 +1589,11 @@ def register(ctx) -> None:
     """
     _ensure_console_handler()
     ctx.register_tts_provider(TTSRouterProvider())
+
+    # Register the bg-tts-st streaming provider (for voice-mode / gateway
+    # streaming readback). Best-effort — Hermes's streaming module may not be
+    # available in all contexts.
+    _register_st_streaming_provider()
 
     # Manage the persistent bg-tts-v5-mlx server.
     try:
