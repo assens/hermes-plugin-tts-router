@@ -157,6 +157,34 @@ env -u PYTHONPATH ~/.hermes/venvs/bg-tts-v5/bin/huggingface-cli download \
 The model's codec (`nineninesix/nemo-nano-codec-22khz...`) is downloaded
 automatically on first synthesis.
 
+### Persistent server (recommended)
+
+By default the plugin reloads the ~965MB model on *every* Bulgarian prompt
+(spawning a subprocess per request). To avoid that overhead, a **persistent
+server** keeps the model resident across requests:
+
+```bash
+# Start the server (loads model on first request, unloads after 5 min idle)
+~/.hermes/scripts/bg_tts_server.sh start
+
+# Other commands
+~/.hermes/scripts/bg_tts_server.sh status
+~/.hermes/scripts/bg_tts_server.sh restart
+~/.hermes/scripts/bg_tts_server.sh stop
+```
+
+The server:
+- Runs on **`http://127.0.0.1:8001`** (configurable via
+  `tts.tts_router.mlx.server_url`)
+- Loads `bg-tts-v5-mlx` + codec **once** on the first request
+- Keeps them resident for subsequent requests (near-instant)
+- **Auto-unloads after 5 minutes idle** (configurable via
+  `--idle-timeout`), reloading lazily on the next request
+
+The tts-router **tries the server first**; if it's not running it transparently
+falls back to the subprocess-per-request path. So the server is an
+optimization, not a requirement — Bulgarian TTS works either way.
+
 > **Note:** This backend runs entirely on Apple Silicon via MLX. It is not
 > served through oMLX — oMLX's built-in TTS engine doesn't support the custom
 > `bg-tts-v5-mlx` architecture, so the plugin calls the model's own inference

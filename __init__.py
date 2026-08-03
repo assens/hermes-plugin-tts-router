@@ -512,24 +512,112 @@ if __name__ == "__main__":
 '''
 
 
+_DEFAULT_MLX_SERVER = "http://127.0.0.1:8001"
+
+
+def _synthesize_via_server(
+    text: str,
+    output_path: str,
+    cfg: Dict[str, Any],
+    format: str = "mp3",
+) -> bool:
+    """Try to synthesize via the persistent bg-tts-v5-mlx HTTP server.
+
+    Returns True if the server handled the request (audio written), False if
+    the server is not available (so the caller falls back to subprocess).
+    Raises RuntimeError if the server is up but synthesis fails.
+
+    The server keeps the model resident across requests, avoiding the
+    per-request ~965MB model reload. ``cfg`` may include ``server_url``
+    (default ``http://127.0.0.1:8001``) and any synthesis params.
+    """
+    import json
+    import urllib.request
+    import urllib.error
+
+    server_url = (cfg.get("server_url") or _DEFAULT_MLX_SERVER).rstrip("/")
+    payload = {
+        "text": text,
+        "speaker_id": int(cfg.get("speaker_id", 0)),
+        "temperature": float(cfg.get("temperature", 0.25)),
+        "top_k": int(cfg.get("top_k", 50)),
+        "top_p": float(cfg.get("top_p", 0.8)),
+        "rep_penalty": float(cfg.get("rep_penalty", 1.1)),
+        "max_tokens": int(cfg.get("max_tokens", 2000)),
+    }
+    req = urllib.request.Request(
+        f"{server_url}/tts",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            audio = resp.read()
+    except urllib.error.HTTPError as exc:
+        # Server responded with an error (4xx/5xx) -> server is up but failed.
+        body = exc.read().decode("utf-8", "replace")
+        raise RuntimeError(f"bg-tts server error {exc.code}: {body}") from exc
+    except urllib.error.URLError:
+        # Server not reachable -> caller falls back to subprocess path.
+        return False
+
+    if not audio:
+        raise RuntimeError("bg-tts server returned empty audio")
+
+    # Server returns wav (22050 Hz). Write it, then convert to requested format.
+    if str(format).lower() == "wav" or output_path.lower().endswith(".wav"):
+        with open(output_path, "wb") as f:
+            f.write(audio)
+        return True
+
+    import subprocess as _sp
+    tmp_wav = output_path + ".server.wav"
+    with open(tmp_wav, "wb") as f:
+        f.write(audio)
+    try:
+        _sp.run(
+            ["ffmpeg", "-y", "-i", tmp_wav, output_path],
+            check=True, capture_output=True,
+        )
+    finally:
+        if os.path.exists(tmp_wav):
+            os.unlink(tmp_wav)
+    return True
+
+
 def _generate_mlx_bg(
     text: str,
     output_path: str,
     cfg: Dict[str, Any],
     format: str = "mp3",
 ) -> str:
-    """Synthesize Bulgarian speech with bg-tts-v5-mlx in a dedicated venv.
+    """Synthesize Bulgarian speech with bg-tts-v5-mlx.
 
-    The MLX stack (mlx, nanocodec-mlx) runs in ``~/.hermes/venvs/bg-tts-v5``.
-    This function shells out to ``_WORKER_V5_SCRIPT`` there, passing
-    text/options as JSON. Raises on any failure so the caller falls back to
-    Edge TTS. The venv python can be overridden via the ``python`` option in
+    Prefers the persistent HTTP server (``_synthesize_via_server``) which
+    keeps the model resident across requests. If the server isn't running,
+    falls back to the subprocess-per-request path (``_WORKER_V5_SCRIPT``),
+    which reloads the ~965MB model each time. Raises on any failure so the
+    caller falls back to Edge TTS. The venv python can be overridden via the
+    ``python`` option, and the server URL via ``server_url``, in
     ``tts.tts_router.mlx``.
     """
     import json
     import os
     import subprocess
 
+    # 1) Try the persistent server first.
+    try:
+        if _synthesize_via_server(text, output_path, cfg, format):
+            logger.info("TTS Router: bg-tts-v5-mlx served by persistent server")
+            return output_path
+    except Exception as exc:  # noqa: BLE001 — server failed, fall back
+        logger.warning(
+            "TTS Router: bg-tts-v5-mlx server failed (%s); using subprocess",
+            exc,
+        )
+
+    # 2) Fall back to subprocess-per-request.
     python_bin = cfg.get("python") or os.path.expanduser(
         "~/.hermes/venvs/bg-tts-v5/bin/python"
     )
