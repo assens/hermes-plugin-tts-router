@@ -279,7 +279,7 @@ token, so it terminates cleanly. Use the bundled test CLI to evaluate it
 ```
 
 The model needs a **reference speaker** (voice cloning). By default it uses
-the model's bundled `sample_bg.wav`; pass your own for a different voice:
+the model's bundled `sample_mixed.wav`; pass your own for a different voice:
 
 ```bash
 # Clone from your own reference WAV (3-10s of clean speech)

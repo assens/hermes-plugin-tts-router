@@ -18,8 +18,8 @@ Usage
 -----
     ~/.hermes/scripts/bg_tts_38m_cli.py "Текст за синтез" [--speaker-wav ref.wav]
 
-If no speaker is given, the model's bundled Bulgarian sample
-(samples/sample_bg.wav) is used as the reference voice.
+If no speaker is given, the model's bundled Bulgarian/English mixed sample
+(samples/sample_mixed.wav) is used as the reference voice.
 """
 
 import argparse
@@ -30,7 +30,7 @@ import sys
 
 DEFAULT_VENV = os.path.expanduser("~/.hermes/venvs/bg-tts/bin/python")
 DEFAULT_MODEL_DIR = os.path.expanduser("~/.hermes/models/BgTTS-38M")
-DEFAULT_SPEAKER = os.path.join(DEFAULT_MODEL_DIR, "samples", "sample_bg.wav")
+DEFAULT_SPEAKER = os.path.join(DEFAULT_MODEL_DIR, "samples", "sample_mixed.wav")
 
 # Worker synthesis logic — mirrors the model card's inference path.
 _WORKER = r'''
@@ -161,7 +161,7 @@ def main():
                              "(default: ~/.hermes/models/BgTTS-38M)")
     parser.add_argument("--speaker-wav", default=None,
                         help="Reference audio WAV for voice cloning (default: "
-                             "the model's bundled sample_bg.wav). Required if "
+                             "the model's bundled sample_mixed.wav). Required if "
                              "--speaker-emb is not given.")
     parser.add_argument("--speaker-emb", default=None,
                         help="Path to a saved speaker embedding (.pt or .npy). "
