@@ -68,13 +68,18 @@ speech tokens → decode via MioCodec → wav).
 
 from __future__ import annotations
 
+import atexit
+import json
 import logging
 import logging.handlers
 import os
 import re
 import subprocess
 import tempfile
+import time
 import unicodedata
+import urllib.error
+import urllib.request
 from typing import Any, Dict, Optional
 
 from agent.tts_provider import TTSProvider
@@ -514,6 +519,133 @@ if __name__ == "__main__":
 
 _DEFAULT_MLX_SERVER = "http://127.0.0.1:8001"
 
+# Dedicated venv + server script paths for the bg-tts-v5-mlx persistent server.
+_MLX_SERVER_SCRIPT = os.path.expanduser("~/.hermes/scripts/bg_tts_server.py")
+_MLX_SERVER_LAUNCHER = os.path.expanduser("~/.hermes/scripts/bg_tts_server.sh")
+_MLX_VENV_PYTHON = os.path.expanduser("~/.hermes/venvs/bg-tts-v5/bin/python")
+_MLX_SERVER_PIDFILE = os.path.expanduser("~/.hermes/logs/bg-tts-server.pid")
+
+
+def _server_healthy(server_url: str = _DEFAULT_MLX_SERVER) -> bool:
+    """Return True if the bg-tts server is reachable and healthy."""
+    try:
+        req = urllib.request.Request(f"{server_url}/health", method="GET")
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            if resp.status != 200:
+                return False
+            body = json.loads(resp.read().decode("utf-8"))
+            return body.get("status") == "ok"
+    except Exception:  # noqa: BLE001 — any failure means not healthy
+        return False
+
+
+def _ensure_server_running(
+    cfg: Dict[str, Any] | None = None,
+) -> bool:
+    """Start the persistent bg-tts-v5-mlx server if it isn't already running.
+
+    Idempotent: checks ``/health`` first; only starts the subprocess if the
+    server is unreachable. Returns True if a server is running (started now or
+    already up). Never raises — a failure just means the router falls back to
+    the subprocess-per-request path.
+    """
+    server_url = (cfg or {}).get("server_url") or _DEFAULT_MLX_SERVER
+    if _server_healthy(server_url):
+        return True
+
+    script = _MLX_SERVER_SCRIPT
+    python_bin = (cfg or {}).get("python") or _MLX_VENV_PYTHON
+    python_bin = os.path.expanduser(python_bin)
+    if not os.path.exists(script) or not os.path.exists(python_bin):
+        logger.warning(
+            "TTS Router: cannot auto-start bg-tts server (missing %s or %s); "
+            "will use subprocess-per-request",
+            script, python_bin,
+        )
+        return False
+
+    # Start the server detached, writing logs + pidfile like the launcher.
+    log_dir = os.path.expanduser("~/.hermes/logs")
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, "bg-tts-server.log")
+    clean_env = {k: v for k, v in os.environ.items()
+                 if k not in ("PYTHONPATH", "PYTHONHOME")}
+    # Pre-load the model on startup so the first real request is fast?
+    # No — let the model load lazily (idle unload timer starts on load).
+    try:
+        logf = open(log_path, "ab")
+        proc = subprocess.Popen(
+            [python_bin, script, "--port", "8001", "--idle-timeout", "300"],
+            stdin=subprocess.DEVNULL,
+            stdout=logf,
+            stderr=subprocess.STDOUT,
+            env=clean_env,
+            start_new_session=True,  # detach from Hermes process group
+            close_fds=True,
+        )
+        logf.close()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("TTS Router: failed to start bg-tts server: %s", exc)
+        return False
+
+    # Write pidfile (mirror the launcher's convention).
+    try:
+        with open(_MLX_SERVER_PIDFILE, "w") as f:
+            f.write(str(proc.pid))
+    except Exception:  # noqa: BLE001 — pidfile is best-effort
+        pass
+
+    logger.info(
+        "TTS Router: started bg-tts-v5-mlx server (pid %d) on %s",
+        proc.pid, server_url,
+    )
+    # Give it a moment to bind the socket.
+    for _ in range(20):
+        if _server_healthy(server_url):
+            return True
+        time.sleep(0.5)
+    logger.warning("TTS Router: bg-tts server started but not yet healthy")
+    return True
+
+
+def _stop_server(server_url: str = _DEFAULT_MLX_SERVER) -> None:
+    """Stop the persistent bg-tts-v5-mlx server if it's running.
+
+    Terminates the server subprocess and removes the pidfile. Safe to call
+    multiple times.
+    """
+    # 1) Kill via pidfile if present.
+    pid = None
+    try:
+        if os.path.exists(_MLX_SERVER_PIDFILE):
+            with open(_MLX_SERVER_PIDFILE) as f:
+                pid = int(f.read().strip())
+    except Exception:  # noqa: BLE001
+        pid = None
+    if pid:
+        try:
+            os.kill(pid, 15)  # SIGTERM — server handles it and unloads
+        except ProcessLookupError:
+            pass
+        except Exception:  # noqa: BLE001
+            logger.warning("TTS Router: could not kill server pid %s", pid)
+        try:
+            os.unlink(_MLX_SERVER_PIDFILE)
+        except OSError:
+            pass
+
+    # 2) If still reachable, ask it to shut down (last resort).
+    if _server_healthy(server_url):
+        try:
+            urllib.request.urlopen(
+                urllib.request.Request(f"{server_url}/shutdown", method="POST"),
+                timeout=2,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    logger.info("TTS Router: stopped bg-tts-v5-mlx server")
+
 
 def _synthesize_via_server(
     text: str,
@@ -927,7 +1059,23 @@ def _ensure_console_handler() -> None:
 
 
 def register(ctx) -> None:
-    """Plugin entry point — wire TTSRouterProvider into the TTS registry."""
+    """Plugin entry point — wire TTSRouterProvider into the TTS registry.
+
+    Also manages the persistent bg-tts-v5-mlx server lifecycle:
+    - starts the server on plugin load (idempotent — no-op if already running)
+    - stops it when the Hermes process exits (via ``atexit``)
+    """
     _ensure_console_handler()
     ctx.register_tts_provider(TTSRouterProvider())
+
+    # Manage the persistent bg-tts-v5-mlx server.
+    try:
+        _ensure_server_running()
+        # Stop the server when the Hermes process exits.
+        if not getattr(_stop_server, "_registered", False):
+            atexit.register(_stop_server)
+            _stop_server._registered = True
+    except Exception as exc:  # noqa: BLE001 — never block plugin registration
+        logger.warning("TTS Router: server lifecycle setup failed: %s", exc)
+
     logger.info("TTS Router plugin registered: BG→MLX/Edge, Other→OpenAI")

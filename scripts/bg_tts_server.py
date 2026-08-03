@@ -172,6 +172,14 @@ def main():
                 self._send_json(404, {"error": "not found"})
 
         def do_POST(self):
+            if self.path.split("?")[0] == "/shutdown":
+                # Graceful shutdown — stop the server after this request.
+                threading.Thread(target=lambda: (
+                    time.sleep(0.1),
+                    self.server.shutdown(),
+                ), daemon=True).start()
+                self._send_json(200, {"status": "shutting down"})
+                return
             if self.path.split("?")[0] != "/tts":
                 self._send_json(404, {"error": "not found"})
                 return

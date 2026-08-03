@@ -185,6 +185,19 @@ The tts-router **tries the server first**; if it's not running it transparently
 falls back to the subprocess-per-request path. So the server is an
 optimization, not a requirement — Bulgarian TTS works either way.
 
+### Auto lifecycle management
+
+The plugin manages the server for you automatically:
+
+- **On load** (`register()`) the plugin starts the server if it isn't already
+  running (idempotent — no-op if healthy).
+- **On exit** (Hermes process shutdown) the plugin stops the server via an
+  `atexit` hook, releasing the model's memory.
+
+So you normally don't need to run the launcher manually — Hermes starts and
+stops the server with itself. The launcher remains useful for manual control
+(e.g. keeping the server hot across Hermes restarts, or checking status).
+
 > **Note:** This backend runs entirely on Apple Silicon via MLX. It is not
 > served through oMLX — oMLX's built-in TTS engine doesn't support the custom
 > `bg-tts-v5-mlx` architecture, so the plugin calls the model's own inference
