@@ -260,13 +260,26 @@ where `pcm_base64` is **raw little-endian int16 mono 24 kHz PCM** — ready for
 streaming playback without any conversion.
 
 The tts-router plugin **registers a streaming provider** (under the name
-`tts-router`) with Hermes's streaming-TTS machinery, so Hermes's voice-mode /
-gateway streaming path (`stream_tts_to_speaker`, `StreamingTTSConsumer`) can
-read back mixed BG/EN audio while it's being generated.
+`tts-router`) with Hermes's streaming-TTS machinery. The provider routes by
+language (same `classify_text` logic as `synthesize`): Bulgarian/mixed →
+bg-tts-st `/stream`, English/other → delegates to the OpenAI streaming
+provider (Kokoro).
 
-> **Note:** This unlocks streaming for Hermes's **voice-mode / gateway**
-> streaming path. It does **not** change the desktop *typed-text* flow, which
-> synthesizes the whole response as a file after the LLM finishes generating.
+#### Where streaming TTS is available
+
+Streaming playback (hear audio while the LLM is still generating) depends on
+the Hermes surface — not all adapters implement the streaming-TTS contract:
+
+| Surface | Streaming TTS | How it works |
+|---------|:-------------:|--------------|
+| **TUI** (`hermes tui`) | ✅ Yes | `tui_gateway/server.py` → `stream_tts_to_speaker` → `resolve_streaming_provider` → our `BgTtsStStreamer`. Plays each sentence via tempfile→afplay as it's generated. Activate with `HERMES_VOICE_TTS=1` env var + `/voice on`. |
+| **CLI** (`hermes` voice mode) | ✅ Yes | `hermes_cli/voice.py` → `speak_text()` → `stream_tts_to_speaker` → our streamer. Same sentence-overlap pipeline as TUI. |
+| **Telegram / messaging gateway** | ✅ Yes | `StreamingTTSConsumer` feeds PCM chunks to the adapter's `write_streaming_tts` while the LLM generates. Requires the adapter to override `supports_streaming_tts` (Telegram does). |
+| **Desktop (Electron app)** | ❌ No | The `APIServerAdapter` inherits `supports_streaming_tts() → False` and never overrides it. The streaming consumer is created but silently exits; the whole-file `synthesize()` path runs instead (audio plays after the LLM finishes). **No config option or env var activates streaming on the desktop** — it would require the adapter to implement the streaming-TTS methods (a core Hermes change). |
+
+> **Desktop users:** TTS works correctly on the desktop — it just plays the
+> complete audio after the response is generated, not incrementally during
+> generation. For "hear-as-generated" playback, use `hermes tui` in voice mode.
 
 #### Streaming sample-rate detail
 
