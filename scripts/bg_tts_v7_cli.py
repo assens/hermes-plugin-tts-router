@@ -88,10 +88,26 @@ def main():
     generated = output[0][inputs["input_ids"].shape[1]:]
     speech_offset = int(cfg.get("speech_offset", 151669))
     speech_vocab = 12800
+
+    # Truncate at the first non-speech control token. The bg-tts-v7 model
+    # does NOT emit an EOS token — it keeps generating audio tokens past the
+    # end of the spoken text (producing gibberish) until it hits
+    # max_new_tokens. The response is terminated by a non-speech special
+    # token (<|im_end|> = 151645, or <|endoftext|> = 151643). We stop the
+    # first time we see a token below the speech offset (i.e. not an audio
+    # token), which cleanly cuts the real speech from the hallucinated tail.
+    generated_list = [int(t.item()) for t in generated]
+    cut = len(generated_list)
+    for i, tid in enumerate(generated_list):
+        if tid < speech_offset:
+            cut = i
+            break
+    generated_list = generated_list[:cut]
+
     audio_codes = [
-        int(t.item()) - speech_offset
-        for t in generated
-        if speech_offset <= int(t.item()) < speech_offset + speech_vocab
+        t - speech_offset
+        for t in generated_list
+        if speech_offset <= t < speech_offset + speech_vocab
     ]
     if not audio_codes:
         print(json.dumps({"ok": False, "error": "no speech tokens generated"}))
