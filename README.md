@@ -301,6 +301,35 @@ penalty, max tokens). The model runs on Apple Silicon via **MPS** by default
 (`--device mps`; also `cpu`/`cuda`). It works best with short sentences (up
 to ~8s / 200 tokens) — split longer text.
 
+### Testing Ani-Voice-API with the CLI
+
+[`beleata74/Ani-Voice-API`](https://huggingface.co/beleata74/Ani-Voice-API) is
+a **two-stage** Bulgarian TTS: Supertonic generates a reference clip in a
+chosen voice style, then BgTTS uses it as the speaker embedding. It also runs
+Bulgarian text normalization so numbers/dates are read correctly. Use the
+bundled test CLI to evaluate it (does **not** touch routing):
+
+```bash
+# First download the model (once)
+~/.hermes/venvs/ani-voice/bin/hf download \
+  beleata74/Ani-Voice-API --local-dir ~/.hermes/models/Ani-Voice-API
+
+# Synthesize & play (uses the F5 female voice by default)
+~/.hermes/scripts/ani_voice_cli.py "Здравейте! Това е тест на гласа."
+```
+
+Pick a voice style (**F1-F5** female, **M1-M5** male):
+
+```bash
+~/.hermes/scripts/ani_voice_cli.py "Текст" --voice-style F2  # female
+~/.hermes/scripts/ani_voice_cli.py "Текст" --voice-style M1  # male
+```
+
+Numbers/dates are normalized automatically (e.g. "15 май 2026" is read in
+full). Run `--help` for the full option list (speed, device, temperature,
+top-k/top-p, repetition penalty, max tokens). The model runs on Apple Silicon
+via **MPS** by default.
+
 ## Requirements
 
 - `edge-tts` Python package (for the Bulgarian route): `pip install edge-tts`
