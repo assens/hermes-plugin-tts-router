@@ -6,7 +6,8 @@ routes text-to-speech calls based on language detection:
 - **Pure Bulgarian text** (Cyrillic, no Latin mixed in) → **bg-tts-v5-mlx**
   (native Apple Silicon MLX) with automatic fallback to Edge TTS
 - **Mixed Bulgarian** (Cyrillic + Latin letters, e.g. code/brand names) →
-  Edge TTS (Microsoft neural voices, free, no API key)
+  **bg-tts-st** (Ani-Voice-API two-stage: Supertonic → BgTTS, M5 voice) with
+  automatic fallback to Edge TTS
 - **Everything else** → OpenAI TTS (or any OpenAI-compatible endpoint — Kokoro, OpenAI, DeepInfra, etc.)
 
 This lets you keep a single `tts.provider: tts-router` in `config.yaml` and have
@@ -30,7 +31,7 @@ no Latin letters) vs **mixed** (Cyrillic + Latin):
 - **Pure Bulgarian** → `bg-tts-v5-mlx` (native Apple Silicon MLX), falling
   back to Edge TTS on any failure.
 - **Mixed Bulgarian** (contains Latin letters — e.g. code, brand names, URLs)
-  → Edge TTS.
+  → `bg-tts-st` (Ani-Voice-API two-stage), falling back to Edge TTS.
 - **Non-Bulgarian** → OpenAI TTS using `tts.openai.*`.
 
 Each backend reads its own config block independently — all routes stay fully
@@ -44,7 +45,7 @@ backend is kept in the codebase for testing but **not** routed to):
 | Route | Backend | Description |
 |-------|---------|-------------|
 | Pure Bulgarian | `mlx` | **bg-tts-v5-mlx** (native Apple Silicon MLX, ~965MB model). Best quality for Bulgarian. Edge TTS is the automatic fallback on any failure. |
-| Mixed Bulgarian | `edge` | Microsoft Edge neural voices (free, no heavy deps). Robust for text containing Latin letters. |
+| Mixed Bulgarian | `bg-tts-st` | **Ani-Voice-API** two-stage (Supertonic → BgTTS, M5 voice). Handles mixed BG/EN text well. Edge TTS is the automatic fallback on any failure. |
 
 ## Installation
 
@@ -98,12 +99,27 @@ tts:
       top_p: 0.8
       rep_penalty: 1.1
       max_tokens: 2000
+    # Backend for MIXED Bulgarian+English text (Cyrillic + Latin).
+    # "bg-tts-st" (default) = Ani-Voice-API two-stage; "edge" = Edge neural.
+    mixed_backend: bg-tts-st
+    # bg-tts-st (Ani-Voice-API) backend options (used for mixed text)
+    bg_tts_st:
+      voice_style: M5        # Supertonic voice: F1-F5 female, M1-M5 male
+      speed: 1.6
+      python: ~/.hermes/venvs/ani-voice/bin/python  # dedicated Python>=3.13 venv
+      temperature: 0.7
+      top_k: 250
+      top_p: 0.95
+      rep_penalty: 1.1
+      max_new_tokens: 512
+      server_url: http://127.0.0.1:8002
 ```
 
 > Routing is automatic: pure Bulgarian (Cyrillic, no Latin) → `mlx`;
-> mixed Bulgarian (contains Latin letters) → Edge TTS; everything else →
+> mixed Bulgarian (contains Latin letters) → `bg-tts-st`; everything else →
 > OpenAI TTS. The `transformers`/bg-tts-v7 backend is kept in the codebase
-> for testing only and is **not** part of the routing.
+> for testing only and is **not** part of the routing. Edge TTS is the
+> automatic fallback for both Bulgarian routes on any failure.
 
 After configuring, start a new session (`/new` or `/reset`) for the plugin to
 load.
@@ -157,7 +173,7 @@ env -u PYTHONPATH ~/.hermes/venvs/bg-tts-v5/bin/huggingface-cli download \
 The model's codec (`nineninesix/nemo-nano-codec-22khz...`) is downloaded
 automatically on first synthesis.
 
-### Persistent server (recommended)
+### Persistent server for bg-tts-v5-mlx (recommended)
 
 By default the plugin reloads the ~965MB model on *every* Bulgarian prompt
 (spawning a subprocess per request). To avoid that overhead, a **persistent
@@ -206,6 +222,34 @@ stops the server with itself. The launcher remains useful for manual control
 **If the backend can't load or fails for any reason, the router transparently
 falls back to Edge TTS** for Bulgarian text, so the plugin keeps working even
 before the model stack is fully set up.
+
+### Persistent server for bg-tts-st (Ani-Voice-API)
+
+The mixed-Bulgarian backend (`bg-tts-st`) also runs as a **persistent server**
+that keeps Supertonic + BgTTS resident across requests (avoids reloading both
+models on every mixed BG/EN prompt):
+
+```bash
+# Start the server (voice=M5, loads models on first request, unloads after 5 min idle)
+~/.hermes/scripts/bg_tts_st_server.sh start
+
+# Other commands
+~/.hermes/scripts/bg_tts_st_server.sh status
+~/.hermes/scripts/bg_tts_st_server.sh restart
+~/.hermes/scripts/bg_tts_st_server.sh stop
+```
+
+The server:
+- Runs on **`http://127.0.0.1:8002`** (configurable via
+  `tts.tts_router.bg_tts_st.server_url`)
+- Loads Supertonic + BgTTS **once** on the first request
+- Two-stage pipeline: Supertonic renders a reference clip in the configured
+  voice style (default **M5**), then BgTTS uses it as the speaker embedding
+- **Auto-unloads after 5 minutes idle**, reloading lazily on the next request
+- Applies Bulgarian text normalization (numbers/dates) automatically
+
+The tts-router **tries the bg-tts-st server first**, falling back to the
+subprocess-per-request path if it's not running, and to Edge TTS if both fail.
 
 ## Setting Up the bg-tts-v7 Backend (Alternative)
 

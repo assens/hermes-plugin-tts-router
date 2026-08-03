@@ -718,6 +718,386 @@ def _synthesize_via_server(
     return True
 
 
+# ---------------------------------------------------------------------------
+# bg-tts-st (Ani-Voice-API two-stage) synthesis
+# ---------------------------------------------------------------------------
+#
+# bg-tts-st is the Ani-Voice-API two-stage Bulgarian TTS: Supertonic renders
+# the text in a voice style (F1-F5 female, M1-M5 male) to produce a reference
+# clip, then BgTTS uses it as the speaker embedding and synthesizes the final
+# audio. It handles MIXED Bulgarian+English text well. Runs in its own
+# dedicated ani-voice venv, served via a persistent HTTP server (port 8002).
+
+_DEFAULT_ST_SERVER = "http://127.0.0.1:8002"
+
+# Dedicated venv + server script paths for the bg-tts-st persistent server.
+_ST_SERVER_SCRIPT = os.path.expanduser("~/.hermes/scripts/bg_tts_st_server.py")
+_ST_SERVER_LAUNCHER = os.path.expanduser("~/.hermes/scripts/bg_tts_st_server.sh")
+_ST_VENV_PYTHON = os.path.expanduser("~/.hermes/venvs/ani-voice/bin/python")
+_ST_SERVER_PIDFILE = os.path.expanduser("~/.hermes/logs/bg-tts-st-server.pid")
+_ST_SERVER_LOG = os.path.expanduser("~/.hermes/logs/bg-tts-st-server.log")
+
+
+def _st_server_healthy(server_url: str = _DEFAULT_ST_SERVER) -> bool:
+    """Return True if the bg-tts-st server is reachable and healthy."""
+    try:
+        req = urllib.request.Request(f"{server_url}/health", method="GET")
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            if resp.status != 200:
+                return False
+            body = json.loads(resp.read().decode("utf-8"))
+            return body.get("status") == "ok"
+    except Exception:  # noqa: BLE001 — any failure means not healthy
+        return False
+
+
+def _ensure_st_server_running(
+    cfg: Dict[str, Any] | None = None,
+) -> bool:
+    """Start the persistent bg-tts-st server if it isn't already running.
+
+    Idempotent: checks ``/health`` first; only starts the subprocess if the
+    server is unreachable. Returns True if a server is running (started now or
+    already up). Never raises — a failure just means the router falls back to
+    Edge TTS for mixed text.
+    """
+    server_url = (cfg or {}).get("server_url") or _DEFAULT_ST_SERVER
+    if _st_server_healthy(server_url):
+        return True
+
+    script = _ST_SERVER_SCRIPT
+    python_bin = (cfg or {}).get("python") or _ST_VENV_PYTHON
+    python_bin = os.path.expanduser(python_bin)
+    if not os.path.exists(script) or not os.path.exists(python_bin):
+        logger.warning(
+            "TTS Router: cannot auto-start bg-tts-st server (missing %s or %s); "
+            "mixed text will use Edge TTS",
+            script, python_bin,
+        )
+        return False
+
+    log_dir = os.path.expanduser("~/.hermes/logs")
+    os.makedirs(log_dir, exist_ok=True)
+    clean_env = {k: v for k, v in os.environ.items()
+                 if k not in ("PYTHONPATH", "PYTHONHOME")}
+    try:
+        logf = open(_ST_SERVER_LOG, "ab")
+        proc = subprocess.Popen(
+            [python_bin, script, "--port", "8002", "--idle-timeout", "300",
+             "--voice-style", (cfg or {}).get("voice_style", "M5")],
+            stdin=subprocess.DEVNULL,
+            stdout=logf,
+            stderr=subprocess.STDOUT,
+            env=clean_env,
+            start_new_session=True,  # detach from Hermes process group
+            close_fds=True,
+        )
+        logf.close()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("TTS Router: failed to start bg-tts-st server: %s", exc)
+        return False
+
+    try:
+        with open(_ST_SERVER_PIDFILE, "w") as f:
+            f.write(str(proc.pid))
+    except Exception:  # noqa: BLE001 — pidfile is best-effort
+        pass
+
+    logger.info(
+        "TTS Router: started bg-tts-st server (pid %d) on %s",
+        proc.pid, server_url,
+    )
+    for _ in range(20):
+        if _st_server_healthy(server_url):
+            return True
+        time.sleep(0.5)
+    logger.warning("TTS Router: bg-tts-st server started but not yet healthy")
+    return True
+
+
+def _stop_st_server(server_url: str = _DEFAULT_ST_SERVER) -> None:
+    """Stop the persistent bg-tts-st server if it's running.
+
+    Terminates the server subprocess and removes the pidfile. Safe to call
+    multiple times.
+    """
+    pid = None
+    try:
+        if os.path.exists(_ST_SERVER_PIDFILE):
+            with open(_ST_SERVER_PIDFILE) as f:
+                pid = int(f.read().strip())
+    except Exception:  # noqa: BLE001
+        pid = None
+    if pid:
+        try:
+            os.kill(pid, 15)  # SIGTERM
+        except ProcessLookupError:
+            pass
+        except Exception:  # noqa: BLE001
+            logger.warning("TTS Router: could not kill bg-tts-st pid %s", pid)
+        try:
+            os.unlink(_ST_SERVER_PIDFILE)
+        except OSError:
+            pass
+
+    if _st_server_healthy(server_url):
+        try:
+            urllib.request.urlopen(
+                urllib.request.Request(f"{server_url}/shutdown", method="POST"),
+                timeout=2,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    logger.info("TTS Router: stopped bg-tts-st server")
+
+
+def _synthesize_via_st_server(
+    text: str,
+    output_path: str,
+    cfg: Dict[str, Any],
+    format: str = "mp3",
+) -> bool:
+    """Try to synthesize mixed text via the persistent bg-tts-st HTTP server.
+
+    Returns True if the server handled the request (audio written), False if
+    the server is not available (so the caller falls back to Edge TTS). Raises
+    RuntimeError if the server is up but synthesis fails.
+
+    ``cfg`` may include ``server_url`` (default ``http://127.0.0.1:8002``),
+    ``voice_style``, ``speed``, and BgTTS sampling params.
+    """
+    server_url = (cfg.get("server_url") or _DEFAULT_ST_SERVER).rstrip("/")
+    payload = {
+        "text": text,
+        "voice_style": str(cfg.get("voice_style", "M5")),
+        "speed": float(cfg.get("speed", 1.6)),
+        "temperature": float(cfg.get("temperature", 0.7)),
+        "top_k": int(cfg.get("top_k", 250)),
+        "top_p": float(cfg.get("top_p", 0.95)),
+        "rep_penalty": float(cfg.get("rep_penalty", 1.1)),
+        "max_new_tokens": int(cfg.get("max_new_tokens", 512)),
+    }
+    req = urllib.request.Request(
+        f"{server_url}/tts",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            audio = resp.read()
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", "replace")
+        raise RuntimeError(f"bg-tts-st server error {exc.code}: {body}") from exc
+    except urllib.error.URLError:
+        return False
+
+    if not audio:
+        raise RuntimeError("bg-tts-st server returned empty audio")
+
+    # Server returns wav (24000 Hz). Write it, then convert to requested format.
+    if str(format).lower() == "wav" or output_path.lower().endswith(".wav"):
+        with open(output_path, "wb") as f:
+            f.write(audio)
+        return True
+
+    import subprocess as _sp
+    tmp_wav = output_path + ".st.server.wav"
+    with open(tmp_wav, "wb") as f:
+        f.write(audio)
+    try:
+        _sp.run(
+            ["ffmpeg", "-y", "-i", tmp_wav, output_path],
+            check=True, capture_output=True,
+        )
+    finally:
+        if os.path.exists(tmp_wav):
+            os.unlink(tmp_wav)
+    return True
+
+
+# The bg-tts-st subprocess-per-request worker (mirrors bg_tts_st_server.py's
+# two-stage pipeline). Used only when the server isn't running.
+_ST_WORKER_SCRIPT = r'''
+import json, os, sys
+
+def main():
+    try:
+        opts = json.loads(sys.argv[1])
+    except Exception as exc:
+        print(json.dumps({"ok": False, "error": f"bad opts: {exc}"}))
+        return 1
+
+    text = opts["text"]
+    output_path = opts["output_path"]
+    cfg = opts.get("cfg", {})
+    out_format = opts.get("format", "mp3")
+
+    import io
+    import tempfile
+    import wave
+    import shutil
+
+    import numpy as np
+
+    model_dir = cfg.get("model_dir") or os.path.expanduser(
+        "~/.hermes/models/Ani-Voice-API"
+    )
+    model_dir = os.path.expanduser(model_dir)
+    os.chdir(model_dir)
+    sys.path.insert(0, model_dir)
+    sys.path.insert(0, os.path.join(model_dir, "BgTTS"))
+
+    from inference import synthesize as bgtts_synthesize
+    from normalizer import normalize_text
+    import supertonic
+    from supertonic import TTS
+
+    device = cfg.get("device", "mps")
+    voice_style = cfg.get("voice_style", "M5")
+    speed = float(cfg.get("speed", 1.6))
+
+    st = TTS(auto_download=True)
+    v_style = st.get_voice_style(voice_name=voice_style)
+
+    clean_text = text.replace('"', '').replace('„', '').replace('“', '') \
+                     .replace("\u2019", "'").replace("\u2013", "-").replace("\u2014", "-") \
+                     .replace("*", "")
+    if not clean_text.strip():
+        raise RuntimeError("empty text after cleaning")
+
+    wav_array, _ = st.synthesize(clean_text, voice_style=v_style, lang="bg", speed=speed)
+    wav_data = np.asarray(wav_array).flatten()
+    wav_max = np.max(np.abs(wav_data))
+    if wav_max > 0:
+        wav_data = wav_data / wav_max
+    pcm = (wav_data * 32767).astype(np.int16)
+
+    fd, ref_path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    try:
+        with wave.open(ref_path, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(44100)
+            wf.writeframes(pcm.tobytes())
+
+        normalized = normalize_text(clean_text)
+        fd2, final_path = tempfile.mkstemp(suffix=".wav")
+        os.close(fd2)
+        os.unlink(final_path)
+        try:
+            bgtts_synthesize(
+                checkpoint=os.path.join(model_dir, "BgTTS", "checkpoint_inference.pt"),
+                text=normalized,
+                output=final_path,
+                speaker_wav=ref_path,
+                device=device,
+                temperature=float(cfg.get("temperature", 0.7)),
+                top_k=int(cfg.get("top_k", 250)),
+                top_p=float(cfg.get("top_p", 0.95)),
+                rep_penalty=float(cfg.get("rep_penalty", 1.1)),
+                max_tokens=int(cfg.get("max_new_tokens", 512)),
+            )
+            if not os.path.exists(final_path) or os.path.getsize(final_path) == 0:
+                raise RuntimeError("BgTTS produced no audio output")
+            shutil.copyfile(final_path, output_path)
+            dur = 0.0
+            try:
+                with wave.open(output_path, "rb") as wf:
+                    dur = wf.getnframes() / wf.getframerate()
+            except Exception:
+                pass
+            print(json.dumps({"ok": True, "output_path": output_path,
+                              "voice_style": voice_style, "duration": round(dur, 3)}))
+            return 0
+        finally:
+            try:
+                os.remove(final_path)
+            except OSError:
+                pass
+    finally:
+        try:
+            os.remove(ref_path)
+        except OSError:
+            pass
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''
+
+
+def _generate_st_bg(
+    text: str,
+    output_path: str,
+    cfg: Dict[str, Any],
+    format: str = "mp3",
+) -> str:
+    """Synthesize mixed Bulgarian+English text with bg-tts-st.
+
+    Prefers the persistent HTTP server (``_synthesize_via_st_server``) which
+    keeps Supertonic + BgTTS resident across requests. If the server isn't
+    running, falls back to the subprocess-per-request path
+    (``_ST_WORKER_SCRIPT``). Raises on any failure so the caller falls back to
+    Edge TTS.
+    """
+    import subprocess as _sp
+
+    # 1) Try the persistent server first.
+    try:
+        if _synthesize_via_st_server(text, output_path, cfg, format):
+            logger.info("TTS Router: bg-tts-st served by persistent server")
+            return output_path
+    except Exception as exc:  # noqa: BLE001 — server failed, fall back
+        logger.warning(
+            "TTS Router: bg-tts-st server failed (%s); using subprocess", exc,
+        )
+
+    # 2) Fall back to subprocess-per-request.
+    python_bin = cfg.get("python") or os.path.expanduser(
+        "~/.hermes/venvs/ani-voice/bin/python"
+    )
+    python_bin = os.path.expanduser(python_bin)
+    if not os.path.exists(python_bin):
+        raise RuntimeError(
+            f"ani-voice venv python not found at {python_bin}. Create it with: "
+            "python3.13 -m venv ~/.hermes/venvs/ani-voice && "
+            "~/.hermes/venvs/ani-voice/bin/pip install supertonic "
+            "bg-text-normalizer num2cyrillic soundfile numpy torch torchaudio "
+            "'miocodec @ git+https://github.com/Aratako/MioCodec@main'"
+        )
+
+    opts = {
+        "text": text,
+        "output_path": output_path,
+        "cfg": cfg,
+        "format": format,
+    }
+    clean_env = {k: v for k, v in os.environ.items()
+                 if k not in ("PYTHONPATH", "PYTHONHOME")}
+    proc = _sp.run(
+        [python_bin, "-c", _ST_WORKER_SCRIPT, json.dumps(opts)],
+        capture_output=True,
+        text=True,
+        timeout=600,
+        env=clean_env,
+    )
+    result = None
+    for line in reversed(proc.stdout.splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                result = json.loads(line)
+                break
+            except json.JSONDecodeError:
+                continue
+    if proc.returncode != 0 or not result or not result.get("ok"):
+        detail = (result or {}).get("error") or proc.stderr.strip() or proc.stdout.strip()
+        raise RuntimeError(f"bg-tts-st synthesis failed: {detail}")
+    return result.get("output_path") or output_path
+
+
 def _generate_mlx_bg(
     text: str,
     output_path: str,
@@ -816,8 +1196,10 @@ class TTSRouterProvider(TTSProvider):
         self._bg_words_override: Optional[frozenset] = None
         self._min_cyrillic: int = 1
         self._bg_backend: str = "transformers"
+        self._mixed_backend: str = "bg-tts-st"
         self._transformers_cfg: Dict[str, Any] = {}
         self._mlx_cfg: Dict[str, Any] = {}
+        self._st_cfg: Dict[str, Any] = {}
 
     def _load_router_config(self, tts_config: Dict[str, Any]) -> None:
         """Load router-specific overrides from ``tts.tts_router`` block."""
@@ -843,6 +1225,15 @@ class TTSRouterProvider(TTSProvider):
         else:
             self._bg_backend = "transformers"
 
+        # Backend for MIXED Bulgarian+English text. Options:
+        #   "bg-tts-st" (default) — Ani-Voice-API two-stage (Supertonic→BgTTS).
+        #   "edge" — Microsoft Edge neural voices (the previous behaviour).
+        mixed_backend = router_cfg.get("mixed_backend", "bg-tts-st")
+        if isinstance(mixed_backend, str):
+            self._mixed_backend = mixed_backend.strip().lower()
+        else:
+            self._mixed_backend = "bg-tts-st"
+
         t_cfg = router_cfg.get("transformers")
         if isinstance(t_cfg, dict):
             self._transformers_cfg = dict(t_cfg)
@@ -854,6 +1245,12 @@ class TTSRouterProvider(TTSProvider):
             self._mlx_cfg = dict(m_cfg)
         else:
             self._mlx_cfg = {}
+
+        st_cfg = router_cfg.get("bg_tts_st")
+        if isinstance(st_cfg, dict):
+            self._st_cfg = dict(st_cfg)
+        else:
+            self._st_cfg = {}
 
     @property
     def name(self) -> str:
@@ -930,12 +1327,14 @@ class TTSRouterProvider(TTSProvider):
         category: str,
         tts_config: Dict[str, Any],
     ) -> str:
-        """Route Bulgarian text to the MLX model or Edge TTS.
+        """Route Bulgarian text to the MLX / bg-tts-st / Edge backend.
 
         ``category`` comes from :func:`classify_text`:
         - ``"mlx"`` — pure Bulgarian → bg-tts-v5-mlx (native Apple Silicon
           MLX). Any failure falls back to Edge TTS.
-        - ``"edge"`` — mixed Bulgarian (Cyrillic + Latin) → Edge TTS.
+        - ``"edge"`` — mixed Bulgarian (Cyrillic + Latin) → bg-tts-st by
+          default (the Ani-Voice-API two-stage model handles mixed BG/EN
+          well), falling back to Edge TTS.
 
         ``tts_config`` is the **full** ``tts:`` config dict, passed through
         to ``_generate_edge_tts`` so the configured Bulgarian voice is
@@ -953,6 +1352,21 @@ class TTSRouterProvider(TTSProvider):
             except Exception as exc:  # noqa: BLE001 — any failure falls back
                 logger.warning(
                     "TTS Router: bg-tts-v5-mlx FAILED (%s); FALLING BACK → Edge TTS",
+                    exc,
+                )
+
+        # Mixed Bulgarian + Latin text → bg-tts-st (if configured), else Edge.
+        if category == "edge" and self._mixed_backend == "bg-tts-st":
+            try:
+                logger.info(
+                    "TTS Router: generating mixed text via bg-tts-st "
+                    "(voice=%s)...",
+                    self._st_cfg.get("voice_style", "M5"),
+                )
+                return _generate_st_bg(text, output_path, self._st_cfg, format)
+            except Exception as exc:  # noqa: BLE001 — any failure falls back
+                logger.warning(
+                    "TTS Router: bg-tts-st FAILED (%s); FALLING BACK → Edge TTS",
                     exc,
                 )
 
@@ -1002,9 +1416,12 @@ class TTSRouterProvider(TTSProvider):
                     text, len(text),
                 )
             else:
+                target = "bg-tts-st" if self._mixed_backend == "bg-tts-st" else "Edge TTS"
                 logger.info(
-                    "TTS Router: ROUTED → Edge TTS (voice=%s)  | text='%s' (%d chars)",
-                    edge_voice, text, len(text),
+                    "TTS Router: ROUTED → %s (voice=%s)  | text='%s' (%d chars)",
+                    target,
+                    self._st_cfg.get("voice_style", "M5") if self._mixed_backend == "bg-tts-st" else edge_voice,
+                    text, len(text),
                 )
             return self._generate_bg(
                 text, output_path, format, category, tts_config
@@ -1061,9 +1478,9 @@ def _ensure_console_handler() -> None:
 def register(ctx) -> None:
     """Plugin entry point — wire TTSRouterProvider into the TTS registry.
 
-    Also manages the persistent bg-tts-v5-mlx server lifecycle:
-    - starts the server on plugin load (idempotent — no-op if already running)
-    - stops it when the Hermes process exits (via ``atexit``)
+    Also manages the persistent bg-tts-v5-mlx and bg-tts-st server lifecycles:
+    - starts each server on plugin load (idempotent — no-op if already running)
+    - stops them when the Hermes process exits (via ``atexit``)
     """
     _ensure_console_handler()
     ctx.register_tts_provider(TTSRouterProvider())
@@ -1077,5 +1494,14 @@ def register(ctx) -> None:
             _stop_server._registered = True
     except Exception as exc:  # noqa: BLE001 — never block plugin registration
         logger.warning("TTS Router: server lifecycle setup failed: %s", exc)
+
+    # Manage the persistent bg-tts-st (Ani-Voice-API) server.
+    try:
+        _ensure_st_server_running()
+        if not getattr(_stop_st_server, "_registered", False):
+            atexit.register(_stop_st_server)
+            _stop_st_server._registered = True
+    except Exception as exc:  # noqa: BLE001 — never block plugin registration
+        logger.warning("TTS Router: bg-tts-st server lifecycle setup failed: %s", exc)
 
     logger.info("TTS Router plugin registered: BG→MLX/Edge, Other→OpenAI")
