@@ -5,7 +5,8 @@ TTS Router Plugin
 Routes text-to-speech calls between two backends based on language detection:
 
 - **Bulgarian text** → a Bulgarian TTS backend, defaulting to
-  `bg-tts-v7` (transformers direct) with automatic fallback to Edge TTS.
+  `bg-tts-v5-mlx` (native Apple Silicon MLX) with automatic fallback to
+  Edge TTS.
 - **Everything else** → OpenAI TTS (local Kokoro or configured endpoint)
 
 Bulgarian detection uses two signals (either triggers the BG route):
@@ -393,6 +394,128 @@ def _generate_transformers_bg(
 
 
 # ---------------------------------------------------------------------------
+# bg-tts-v5-mlx (native MLX) synthesis
+# ---------------------------------------------------------------------------
+
+# bg-tts-v5-mlx is a self-contained MLX (Apple Silicon) TTS model. It runs
+# entirely via its bundled ``tts_mlx`` package — no server needed. Because
+# oMLX's TTS engine doesn't support the custom ``bg-tts-v5-mlx`` architecture,
+# we call the model's own ``synthesize()`` function directly in a dedicated
+# venv. The worker mirrors the model card's usage and writes the wav, then
+# (optionally) converts to the requested container format.
+
+_WORKER_V5_SCRIPT = r'''
+import json, os, sys
+
+def main():
+    try:
+        opts = json.loads(sys.argv[1])
+    except Exception as exc:
+        print(json.dumps({"ok": False, "error": f"bad opts: {exc}"}))
+        return 1
+
+    text = opts["text"]
+    output_path = opts["output_path"]
+    cfg = opts.get("cfg", {})
+    out_format = opts.get("format", "mp3")
+
+    checkpoint = cfg.get("checkpoint") or os.path.expanduser(
+        "~/.hermes/models/bg-tts-v5-mlx"
+    )
+    sys.path.insert(0, checkpoint)
+
+    from tts_mlx.inference import synthesize
+
+    wav_path = output_path if str(out_format).lower() == "wav" \
+        or output_path.lower().endswith(".wav") else output_path + ".wav"
+
+    synthesize(
+        checkpoint=checkpoint,
+        text=text,
+        output=wav_path,
+        speaker_id=int(cfg.get("speaker_id", 0)),
+        temperature=float(cfg.get("temperature", 0.25)),
+        top_k=int(cfg.get("top_k", 50)),
+        top_p=float(cfg.get("top_p", 0.8)),
+        rep_penalty=float(cfg.get("rep_penalty", 1.1)),
+        max_tokens=int(cfg.get("max_tokens", 2000)),
+    )
+
+    # Convert to requested container format if it isn't wav.
+    if wav_path != output_path:
+        import subprocess, tempfile
+        subprocess.run(["ffmpeg", "-y", "-i", wav_path, output_path],
+                       check=True, capture_output=True)
+        os.unlink(wav_path)
+
+    print(json.dumps({"ok": True, "output_path": output_path}))
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''
+
+
+def _generate_mlx_bg(
+    text: str,
+    output_path: str,
+    cfg: Dict[str, Any],
+    format: str = "mp3",
+) -> str:
+    """Synthesize Bulgarian speech with bg-tts-v5-mlx in a dedicated venv.
+
+    The MLX stack (mlx, nanocodec-mlx) runs in ``~/.hermes/venvs/bg-tts-v5``.
+    This function shells out to ``_WORKER_V5_SCRIPT`` there, passing
+    text/options as JSON. Raises on any failure so the caller falls back to
+    Edge TTS. The venv python can be overridden via the ``python`` option in
+    ``tts.tts_router.mlx``.
+    """
+    import json
+    import os
+    import subprocess
+
+    python_bin = cfg.get("python") or os.path.expanduser(
+        "~/.hermes/venvs/bg-tts-v5/bin/python"
+    )
+    if not os.path.exists(python_bin):
+        raise RuntimeError(
+            f"bg-tts-v5 venv python not found at {python_bin}. Create it with: "
+            "python3.13 -m venv ~/.hermes/venvs/bg-tts-v5 && "
+            "~/.hermes/venvs/bg-tts-v5/bin/pip install mlx soundfile numpy "
+            "'nanocodec-mlx @ git+https://github.com/nineninesix-ai/nanocodec-mlx.git'"
+        )
+
+    opts = {
+        "text": text,
+        "output_path": output_path,
+        "cfg": cfg,
+        "format": format,
+    }
+    clean_env = {k: v for k, v in os.environ.items()
+                 if k not in ("PYTHONPATH", "PYTHONHOME")}
+    proc = subprocess.run(
+        [python_bin, "-c", _WORKER_V5_SCRIPT, json.dumps(opts)],
+        capture_output=True,
+        text=True,
+        timeout=600,
+        env=clean_env,
+    )
+    result = None
+    for line in reversed(proc.stdout.splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                result = json.loads(line)
+                break
+            except json.JSONDecodeError:
+                continue
+    if proc.returncode != 0 or not result or not result.get("ok"):
+        detail = (result or {}).get("error") or proc.stderr.strip() or proc.stdout.strip()
+        raise RuntimeError(f"bg-tts-v5 synthesis failed: {detail}")
+    return result.get("output_path") or output_path
+
+
+# ---------------------------------------------------------------------------
 # TTS Provider
 # ---------------------------------------------------------------------------
 
@@ -404,8 +527,10 @@ class TTSRouterProvider(TTSProvider):
     config blocks, plus a ``tts.tts_router`` block for routing options.
 
     Bulgarian backend selection (``tts_router.bg_backend``):
-    - ``transformers`` (default) — bg-tts-v7 via transformers, falling back
-      to Edge TTS on any error or missing dependency.
+    - ``mlx`` — bg-tts-v5-mlx (native Apple Silicon MLX), best quality,
+      falling back to Edge TTS on any error or missing dependency.
+    - ``transformers`` — bg-tts-v7 via transformers, falling back to Edge
+      TTS on any error or missing dependency.
     - ``edge`` — always Microsoft Edge neural voices.
     """
 
@@ -414,6 +539,7 @@ class TTSRouterProvider(TTSProvider):
         self._min_cyrillic: int = 1
         self._bg_backend: str = "transformers"
         self._transformers_cfg: Dict[str, Any] = {}
+        self._mlx_cfg: Dict[str, Any] = {}
 
     def _load_router_config(self, tts_config: Dict[str, Any]) -> None:
         """Load router-specific overrides from ``tts.tts_router`` block."""
@@ -445,13 +571,19 @@ class TTSRouterProvider(TTSProvider):
         else:
             self._transformers_cfg = {}
 
+        m_cfg = router_cfg.get("mlx")
+        if isinstance(m_cfg, dict):
+            self._mlx_cfg = dict(m_cfg)
+        else:
+            self._mlx_cfg = {}
+
     @property
     def name(self) -> str:
         return "tts-router"
 
     @property
     def display_name(self) -> str:
-        return "TTS Router (BG→bg-tts-v7/Edge, Other→OpenAI)"
+        return "TTS Router (BG→bg-tts-v5-mlx/Edge, Other→OpenAI)"
 
     def is_available(self) -> bool:
         """Check that the fallback (edge) and default (openai) are importable.
@@ -489,14 +621,28 @@ class TTSRouterProvider(TTSProvider):
     ) -> str:
         """Run the configured Bulgarian backend, falling back to Edge TTS.
 
-        If ``bg_backend: transformers`` is set, try bg-tts-v7 first; on any
-        exception (missing deps, model download failure, empty output, …)
-        log a warning and fall back to Edge TTS. If ``bg_backend: edge`` or
-        transformers isn't configured, go straight to Edge.
+        Backends (``tts_router.bg_backend``), tried in order:
+        - ``mlx`` — bg-tts-v5-mlx (native Apple Silicon MLX), best quality.
+        - ``transformers`` — bg-tts-v7 via transformers.
+        - ``edge`` — always Microsoft Edge neural voices.
+
+        Any exception (missing deps, model download failure, empty output, …)
+        from the chosen backend logs a warning and falls back to Edge TTS.
         """
         from tools.tts_tool import _generate_edge_tts
 
-        if self._bg_backend == "transformers":
+        if self._bg_backend == "mlx":
+            try:
+                logger.info(
+                    "TTS Router: generating Bulgarian via bg-tts-v5-mlx (MLX)..."
+                )
+                return _generate_mlx_bg(text, output_path, self._mlx_cfg, format)
+            except Exception as exc:  # noqa: BLE001 — any failure falls back
+                logger.warning(
+                    "TTS Router: bg-tts-v5-mlx failed (%s); falling back to Edge TTS",
+                    exc,
+                )
+        elif self._bg_backend == "transformers":
             try:
                 logger.info(
                     "TTS Router: generating Bulgarian via bg-tts-v7 (transformers)..."

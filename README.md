@@ -22,21 +22,22 @@ Bulgarian route):
    Cyrillic.
 
 When Bulgarian is detected, the text is sent to the configured Bulgarian
-backend. By default this is **bg-tts-v7** (a fine-tuned Qwen3 TTS model) via
-transformers, with **Edge TTS** as an automatic fallback. Otherwise, it's sent
-to **OpenAI TTS** using the endpoint configured in `tts.openai.*`.
+backend. By default this is **bg-tts-v5-mlx** (a native Apple Silicon MLX TTS
+model) with **Edge TTS** as an automatic fallback. Otherwise, it's sent to
+**OpenAI TTS** using the endpoint configured in `tts.openai.*`.
 
 Each backend reads its own config block independently — all routes stay fully
 configurable.
 
 ### Bulgarian backends
 
-The router supports two backends for Bulgarian text, selected via
+The router supports three backends for Bulgarian text, selected via
 `tts.tts_router.bg_backend`:
 
 | Backend | Description |
 |---------|-------------|
-| `transformers` (default) | **bg-tts-v7** (Qwen3-0.6B fine-tune + MioCodec) run locally via transformers. Edge TTS is the automatic fallback on any failure. |
+| `mlx` (default) | **bg-tts-v5-mlx** (native Apple Silicon MLX, ~965MB model). Best quality for Bulgarian. Edge TTS is the automatic fallback on any failure. |
+| `transformers` | **bg-tts-v7** (Qwen3-0.6B fine-tune + MioCodec) run locally via transformers. Edge TTS is the automatic fallback on any failure. |
 | `edge` | Always Microsoft Edge neural voices (free, no heavy deps). |
 
 ## Installation
@@ -81,8 +82,18 @@ tts:
       - "здравей"
       - "благодаря"
       - "моля"
-    # Bulgarian backend: "transformers" (bg-tts-v7, default) or "edge"
-    bg_backend: transformers
+    # Bulgarian backend: "mlx" (bg-tts-v5-mlx, default), "transformers" (bg-tts-v7), or "edge"
+    bg_backend: mlx
+    # bg-tts-v5-mlx backend options (only read when bg_backend: mlx)
+    mlx:
+      checkpoint: ~/.hermes/models/bg-tts-v5-mlx   # model directory
+      python: ~/.hermes/venvs/bg-tts-v5/bin/python  # dedicated Python>=3.12 venv
+      speaker_id: 0                                 # 0=AI voice, 1=audiobook narrator
+      temperature: 0.25
+      top_k: 50
+      top_p: 0.8
+      rep_penalty: 1.1
+      max_tokens: 2000
     # bg-tts-v7 backend options (only read when bg_backend: transformers)
     transformers:
       model_name: beleata74/bg-tts-v7
@@ -98,7 +109,39 @@ tts:
 After configuring, start a new session (`/new` or `/reset`) for the plugin to
 load.
 
-## Setting Up the bg-tts-v7 Backend
+## Setting Up the bg-tts-v5-mlx Backend
+
+The bg-tts-v5-mlx backend is a **native Apple Silicon MLX** TTS model that runs
+fully on-device. It needs its own dedicated venv (the model requires MLX, which
+is separate from the Hermes runtime).
+
+```bash
+# Create a dedicated venv
+python3.13 -m venv ~/.hermes/venvs/bg-tts-v5
+
+# Install the MLX stack
+env -u PYTHONPATH ~/.hermes/venvs/bg-tts-v5/bin/pip install \
+  mlx soundfile numpy \
+  "nanocodec-mlx @ git+https://github.com/nineninesix-ai/nanocodec-mlx.git"
+
+# Download the model (~965MB)
+env -u PYTHONPATH ~/.hermes/venvs/bg-tts-v5/bin/huggingface-cli download \
+  raditotev/bg-tts-v5-mlx --local-dir ~/.hermes/models/bg-tts-v5-mlx
+```
+
+The model's codec (`nineninesix/nemo-nano-codec-22khz...`) is downloaded
+automatically on first synthesis.
+
+> **Note:** This backend runs entirely on Apple Silicon via MLX. It is not
+> served through oMLX — oMLX's built-in TTS engine doesn't support the custom
+> `bg-tts-v5-mlx` architecture, so the plugin calls the model's own inference
+> module directly.
+
+**If the backend can't load or fails for any reason, the router transparently
+falls back to Edge TTS** for Bulgarian text, so the plugin keeps working even
+before the model stack is fully set up.
+
+## Setting Up the bg-tts-v7 Backend (Alternative)
 
 The bg-tts-v7 transformers backend needs `torch`, `transformers`, and
 `miocodec`. Because `miocodec` requires **Python >= 3.12** (the Hermes runtime
