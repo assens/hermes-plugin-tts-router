@@ -261,6 +261,46 @@ pure test harness. Options mirror the transformers config block:
 Run `--help` for the full option list (model/codec/preset overrides, dtype,
 top-p, repetition penalty, speech offset).
 
+### Testing BgTTS-38M with the CLI
+
+[`beleata74/BgTTS-38M`](https://huggingface.co/beleata74/BgTTS-38M) is a
+lightweight **38M-param** Bulgarian/English encoder-decoder TTS with zero-shot
+voice cloning via MioCodec. Unlike bg-tts-v7 it has a proper end-of-speech
+token, so it terminates cleanly. Use the bundled test CLI to evaluate it
+(does **not** touch routing):
+
+```bash
+# First download the model (once)
+~/.hermes/venvs/bg-tts/bin/huggingface-cli download \
+  beleata74/BgTTS-38M --local-dir ~/.hermes/models/BgTTS-38M
+
+# Synthesize & play (uses the bundled Bulgarian sample as the speaker)
+~/.hermes/scripts/bg_tts_38m_cli.py "Това е тест на българския синтез на реч."
+```
+
+The model needs a **reference speaker** (voice cloning). By default it uses
+the model's bundled `sample_bg.wav`; pass your own for a different voice:
+
+```bash
+# Clone from your own reference WAV (3-10s of clean speech)
+~/.hermes/scripts/bg_tts_38m_cli.py "Здравейте!" --speaker-wav my_voice.wav
+
+# English text (works too, model trained on BG + EN)
+~/.hermes/scripts/bg_tts_38m_cli.py "Hello there." --speaker-wav en_ref.wav
+
+# Use a pre-saved embedding (.pt or .npy) instead of a WAV
+~/.hermes/scripts/bg_tts_38m_cli.py "Текст" --speaker-emb my_voice_emb.pt
+
+# Tune sampling
+~/.hermes/scripts/bg_tts_38m_cli.py "Текст" --temperature 0.5   # stable
+~/.hermes/scripts/bg_tts_38m_cli.py "Текст" --temperature 0.8   # expressive
+```
+
+Run `--help` for the full option list (device, top-k/top-p, repetition
+penalty, max tokens). The model runs on Apple Silicon via **MPS** by default
+(`--device mps`; also `cpu`/`cuda`). It works best with short sentences (up
+to ~8s / 200 tokens) — split longer text.
+
 ## Requirements
 
 - `edge-tts` Python package (for the Bulgarian route): `pip install edge-tts`
