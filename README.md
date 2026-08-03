@@ -108,6 +108,32 @@ tts:
 After configuring, start a new session (`/new` or `/reset`) for the plugin to
 load.
 
+## Logging
+
+The plugin writes every routing decision to its own log file (independent of
+the Hermes desktop console, which does not reliably surface plugin logs):
+
+```
+~/.hermes/logs/tts-router.log
+```
+
+The file is a rotating log (5 MB, 3 backups, UTF-8) and doubles as a
+per-request audit trail of which backend handled each piece of text:
+
+```
+2026-08-03 19:26:03 INFO hermes_plugins.tts__tts_router: TTS Router: ROUTED → Edge TTS (voice=bg-BG-KalinaNeural)  | text='English: The children are playing...' (86 chars)
+2026-08-03 19:26:03 INFO hermes_plugins.tts__tts_router: TTS Router: generating Bulgarian via Edge TTS...
+2026-08-03 19:20:54 INFO hermes_plugins.tts__tts_router: TTS Router: ROUTED → bg-tts-v5-mlx (MLX)  | text='Здравей, как сте?' (16 chars)
+```
+
+The log line for Edge routing includes the voice actually used (e.g.
+`voice=bg-BG-KalinaNeural`), and warnings are emitted whenever the MLX
+backend fails and falls back to Edge. To watch live:
+
+```bash
+tail -f ~/.hermes/logs/tts-router.log
+```
+
 ## Setting Up the bg-tts-v5-mlx Backend
 
 The bg-tts-v5-mlx backend is a **native Apple Silicon MLX** TTS model that runs
@@ -204,8 +230,15 @@ under the name `tts-router`. When `tts.provider: tts-router` is set in
 3. Checks the plugin TTS registry → **found** → dispatches to
    `TTSRouterProvider.synthesize()`
 
-The plugin then delegates to the built-in `_generate_edge_tts` and
-`_generate_openai_tts` functions — it only decides *which* to call.
+The plugin then:
+- **Routes** non-Bulgarian text to the built-in `_generate_openai_tts`
+- **Implements** the Bulgarian backends itself:
+  - `bg-tts-v5-mlx` via a dedicated MLX venv (`_generate_mlx_bg`, shells out
+    to the model's own `tts_mlx` inference module)
+  - `bg-tts-v7` via transformers (`_generate_transformers_bg`, kept for
+    testing, not routed to)
+  - Edge TTS via the built-in `_generate_edge_tts`, passing the full tts
+    config so the configured Bulgarian voice (`bg-BG-KalinaNeural`) is used
 
 ## License
 
