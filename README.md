@@ -1,9 +1,12 @@
 # Hermes Plugin: TTS Router
 
 A [Hermes Agent](https://github.com/NousResearch/hermes-agent) TTS plugin that
-routes text-to-speech calls between two backends based on language detection:
+routes text-to-speech calls based on language detection:
 
-- **Bulgarian text** → Edge TTS (Microsoft neural voices, free, no API key)
+- **Pure Bulgarian text** (Cyrillic, no Latin mixed in) → **bg-tts-v5-mlx**
+  (native Apple Silicon MLX) with automatic fallback to Edge TTS
+- **Mixed Bulgarian** (Cyrillic + Latin letters, e.g. code/brand names) →
+  Edge TTS (Microsoft neural voices, free, no API key)
 - **Everything else** → OpenAI TTS (or any OpenAI-compatible endpoint — Kokoro, OpenAI, DeepInfra, etc.)
 
 This lets you keep a single `tts.provider: tts-router` in `config.yaml` and have
@@ -21,24 +24,27 @@ Bulgarian route):
    lowercase text. Catches edge cases where transliterated text appears without
    Cyrillic.
 
-When Bulgarian is detected, the text is sent to the configured Bulgarian
-backend. By default this is **bg-tts-v5-mlx** (a native Apple Silicon MLX TTS
-model) with **Edge TTS** as an automatic fallback. Otherwise, it's sent to
-**OpenAI TTS** using the endpoint configured in `tts.openai.*`.
+When Bulgarian is detected, it's further split into **pure** (Cyrillic only,
+no Latin letters) vs **mixed** (Cyrillic + Latin):
+
+- **Pure Bulgarian** → `bg-tts-v5-mlx` (native Apple Silicon MLX), falling
+  back to Edge TTS on any failure.
+- **Mixed Bulgarian** (contains Latin letters — e.g. code, brand names, URLs)
+  → Edge TTS.
+- **Non-Bulgarian** → OpenAI TTS using `tts.openai.*`.
 
 Each backend reads its own config block independently — all routes stay fully
 configurable.
 
 ### Bulgarian backends
 
-The router supports three backends for Bulgarian text, selected via
-`tts.tts_router.bg_backend`:
+The router routes Bulgarian to two backends (the `transformers`/bg-tts-v7
+backend is kept in the codebase for testing but **not** routed to):
 
-| Backend | Description |
-|---------|-------------|
-| `mlx` (default) | **bg-tts-v5-mlx** (native Apple Silicon MLX, ~965MB model). Best quality for Bulgarian. Edge TTS is the automatic fallback on any failure. |
-| `transformers` | **bg-tts-v7** (Qwen3-0.6B fine-tune + MioCodec) run locally via transformers. Edge TTS is the automatic fallback on any failure. |
-| `edge` | Always Microsoft Edge neural voices (free, no heavy deps). |
+| Route | Backend | Description |
+|-------|---------|-------------|
+| Pure Bulgarian | `mlx` | **bg-tts-v5-mlx** (native Apple Silicon MLX, ~965MB model). Best quality for Bulgarian. Edge TTS is the automatic fallback on any failure. |
+| Mixed Bulgarian | `edge` | Microsoft Edge neural voices (free, no heavy deps). Robust for text containing Latin letters. |
 
 ## Installation
 
@@ -82,9 +88,7 @@ tts:
       - "здравей"
       - "благодаря"
       - "моля"
-    # Bulgarian backend: "mlx" (bg-tts-v5-mlx, default), "transformers" (bg-tts-v7), or "edge"
-    bg_backend: mlx
-    # bg-tts-v5-mlx backend options (only read when bg_backend: mlx)
+    # bg-tts-v5-mlx backend options (used for pure Bulgarian text)
     mlx:
       checkpoint: ~/.hermes/models/bg-tts-v5-mlx   # model directory
       python: ~/.hermes/venvs/bg-tts-v5/bin/python  # dedicated Python>=3.12 venv
@@ -94,17 +98,12 @@ tts:
       top_p: 0.8
       rep_penalty: 1.1
       max_tokens: 2000
-    # bg-tts-v7 backend options (only read when bg_backend: transformers)
-    transformers:
-      model_name: beleata74/bg-tts-v7
-      codec_model: Aratako/MioCodec-25Hz-24kHz
-      python: ~/.hermes/venvs/bg-tts/bin/python   # dedicated Python>=3.12 venv
-      preset_path: ~/.hermes/venvs/bg-tts/presets/en_female.pt
-      max_new_tokens: 500
-      temperature: 0.7
-      top_p: 0.9
-      repetition_penalty: 1.1
 ```
+
+> Routing is automatic: pure Bulgarian (Cyrillic, no Latin) → `mlx`;
+> mixed Bulgarian (contains Latin letters) → Edge TTS; everything else →
+> OpenAI TTS. The `transformers`/bg-tts-v7 backend is kept in the codebase
+> for testing only and is **not** part of the routing.
 
 After configuring, start a new session (`/new` or `/reset`) for the plugin to
 load.

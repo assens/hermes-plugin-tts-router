@@ -2,11 +2,12 @@
 TTS Router Plugin
 =================
 
-Routes text-to-speech calls between two backends based on language detection:
+Routes text-to-speech calls based on language detection:
 
-- **Bulgarian text** → a Bulgarian TTS backend, defaulting to
-  `bg-tts-v5-mlx` (native Apple Silicon MLX) with automatic fallback to
-  Edge TTS.
+- **Pure Bulgarian text** (Cyrillic, no Latin mixed in) → `bg-tts-v5-mlx`
+  (native Apple Silicon MLX) with automatic fallback to Edge TTS.
+- **Mixed Bulgarian** (Cyrillic + Latin letters, e.g. code or brand names)
+  → Microsoft Edge neural voices.
 - **Everything else** → OpenAI TTS (local Kokoro or configured endpoint)
 
 Bulgarian detection uses two signals (either triggers the BG route):
@@ -147,6 +148,16 @@ def _count_cyrillic(text: str) -> int:
     return len(_CYRILLIC_RE.findall(text))
 
 
+# Latin letters (A-Z a-z). Used to distinguish "pure" Bulgarian text from
+# mixed (Cyrillic + Latin) text.
+_LATIN_RE = re.compile(r"[A-Za-z]")
+
+
+def _count_latin(text: str) -> int:
+    """Count Latin (A-Z a-z) characters in text."""
+    return len(_LATIN_RE.findall(text))
+
+
 def _contains_bulgarian_words(
     text: str, word_set: frozenset, min_chars: int = 2
 ) -> bool:
@@ -206,6 +217,47 @@ def is_bulgarian(
         return True
 
     return False
+
+
+def classify_text(
+    text: str,
+    bulgarian_words: Optional[frozenset] = None,
+    min_cyrillic_chars: int = 1,
+) -> str:
+    """Classify text into a routing category.
+
+    Returns one of:
+    - ``"mlx"`` — pure Bulgarian (Cyrillic, no Latin letters mixed in).
+    - ``"edge"`` — Bulgarian with mixed Latin letters (e.g. code, brand
+      names, URLs) OR text detected as Bulgarian only via word forms with
+      Latin letters present.
+    - ``"other"`` — non-Bulgarian (route to OpenAI TTS).
+
+    Distinguishes "pure" from "mixed" Bulgarian by checking for Latin
+    letters. A text with Cyrillic plus any Latin letter(s) is treated as
+    mixed and sent to the more robust Edge voice rather than the MLX model.
+    """
+    if not text or not text.strip():
+        return "other"
+
+    cyrillic_count = _count_cyrillic(text)
+    latin_count = _count_latin(text)
+    word_set = bulgarian_words or _DEFAULT_BULGARIAN_WORDS
+
+    # Pure Bulgarian: Cyrillic present, no Latin letters.
+    if cyrillic_count >= min_cyrillic_chars and latin_count == 0:
+        return "mlx"
+
+    # Bulgarian present but mixed with Latin → Edge (robust).
+    if cyrillic_count >= min_cyrillic_chars:
+        return "edge"
+
+    # No Cyrillic, but Bulgarian word forms found.
+    if _contains_bulgarian_words(text, word_set):
+        # If there are also Latin letters (e.g. transliteration) → edge.
+        return "edge" if latin_count > 0 else "mlx"
+
+    return "other"
 
 
 # ---------------------------------------------------------------------------
@@ -530,12 +582,13 @@ class TTSRouterProvider(TTSProvider):
     Reads configuration from the standard ``tts.edge`` and ``tts.openai``
     config blocks, plus a ``tts.tts_router`` block for routing options.
 
-    Bulgarian backend selection (``tts_router.bg_backend``):
-    - ``mlx`` — bg-tts-v5-mlx (native Apple Silicon MLX), best quality,
-      falling back to Edge TTS on any error or missing dependency.
-    - ``transformers`` — bg-tts-v7 via transformers, falling back to Edge
-      TTS on any error or missing dependency.
-    - ``edge`` — always Microsoft Edge neural voices.
+    Bulgarian routing:
+    - ``mlx`` — pure Bulgarian text (Cyrillic, no Latin mixed in) →
+      bg-tts-v5-mlx (native Apple Silicon MLX), falling back to Edge TTS
+      on any error or missing dependency.
+    - ``edge`` — Bulgarian text mixed with Latin letters (e.g. code, brand
+      names, URLs) → Microsoft Edge neural voices.
+    - ``other`` — non-Bulgarian → OpenAI TTS.
     """
 
     def __init__(self) -> None:
@@ -587,7 +640,7 @@ class TTSRouterProvider(TTSProvider):
 
     @property
     def display_name(self) -> str:
-        return "TTS Router (BG→bg-tts-v5-mlx/Edge, Other→OpenAI)"
+        return "TTS Router (BG→MLX/Edge, Other→OpenAI)"
 
     def is_available(self) -> bool:
         """Check that the fallback (edge) and default (openai) are importable.
@@ -613,52 +666,17 @@ class TTSRouterProvider(TTSProvider):
         return {
             "name": self.display_name,
             "badge": "free",
-            "tag": "Routes Bulgarian text to bg-tts-v7/Edge, everything else to OpenAI TTS",
+            "tag": "Pure Bulgarian→bg-tts-v5-mlx, mixed Bulgarian→Edge, other→OpenAI TTS",
             "env_vars": [],
         }
 
-    def _generate_bg(
+    def _generate_edge(
         self,
         text: str,
         output_path: str,
-        format: str,
     ) -> str:
-        """Run the configured Bulgarian backend, falling back to Edge TTS.
-
-        Backends (``tts_router.bg_backend``), tried in order:
-        - ``mlx`` — bg-tts-v5-mlx (native Apple Silicon MLX), best quality.
-        - ``transformers`` — bg-tts-v7 via transformers.
-        - ``edge`` — always Microsoft Edge neural voices.
-
-        Any exception (missing deps, model download failure, empty output, …)
-        from the chosen backend logs a warning and falls back to Edge TTS.
-        """
+        """Synthesize via Microsoft Edge neural voices."""
         from tools.tts_tool import _generate_edge_tts
-
-        if self._bg_backend == "mlx":
-            try:
-                logger.info(
-                    "TTS Router: generating Bulgarian via bg-tts-v5-mlx (MLX)..."
-                )
-                return _generate_mlx_bg(text, output_path, self._mlx_cfg, format)
-            except Exception as exc:  # noqa: BLE001 — any failure falls back
-                logger.warning(
-                    "TTS Router: bg-tts-v5-mlx failed (%s); falling back to Edge TTS",
-                    exc,
-                )
-        elif self._bg_backend == "transformers":
-            try:
-                logger.info(
-                    "TTS Router: generating Bulgarian via bg-tts-v7 (transformers)..."
-                )
-                return _generate_transformers_bg(
-                    text, output_path, self._transformers_cfg, format
-                )
-            except Exception as exc:  # noqa: BLE001 — any failure falls back
-                logger.warning(
-                    "TTS Router: bg-tts-v7 failed (%s); falling back to Edge TTS",
-                    exc,
-                )
 
         logger.info("TTS Router: generating Bulgarian via Edge TTS...")
         import asyncio
@@ -676,6 +694,37 @@ class TTSRouterProvider(TTSProvider):
             asyncio.run(_generate_edge_tts(text, output_path, edge_config))
         return output_path
 
+    def _generate_bg(
+        self,
+        text: str,
+        output_path: str,
+        format: str,
+        category: str,
+    ) -> str:
+        """Route Bulgarian text to the MLX model or Edge TTS.
+
+        ``category`` comes from :func:`classify_text`:
+        - ``"mlx"`` — pure Bulgarian → bg-tts-v5-mlx (native Apple Silicon
+          MLX). Any failure falls back to Edge TTS.
+        - ``"edge"`` — mixed Bulgarian (Cyrillic + Latin) → Edge TTS.
+
+        The ``transformers`` (bg-tts-v7) backend is intentionally **not**
+        routed to — it is kept in the codebase for testing only.
+        """
+        if category == "mlx":
+            try:
+                logger.info(
+                    "TTS Router: generating Bulgarian via bg-tts-v5-mlx (MLX)..."
+                )
+                return _generate_mlx_bg(text, output_path, self._mlx_cfg, format)
+            except Exception as exc:  # noqa: BLE001 — any failure falls back
+                logger.warning(
+                    "TTS Router: bg-tts-v5-mlx failed (%s); falling back to Edge TTS",
+                    exc,
+                )
+
+        return self._generate_edge(text, output_path)
+
     def synthesize(
         self,
         text: str,
@@ -689,28 +738,32 @@ class TTSRouterProvider(TTSProvider):
     ) -> str:
         """Route text to the appropriate TTS backend and synthesize.
 
-        Delegates Bulgarian text to :meth:`_generate_bg` (bg-tts-v7 with
-        Edge fallback) and non-Bulgarian text to the built-in
-        ``_generate_openai_tts``. The ``voice`` and ``model`` params from the
-        dispatcher are ignored — each backend reads its own config block so
-        the routes stay independently configurable.
+        Routing (via :func:`classify_text`):
+        - ``"mlx"`` — pure Bulgarian → bg-tts-v5-mlx (MLX), Edge on failure.
+        - ``"edge"`` — mixed Bulgarian (Cyrillic + Latin) → Edge TTS.
+        - ``"other"`` — non-Bulgarian → OpenAI TTS (Kokoro).
+
+        The ``voice`` and ``model`` params from the dispatcher are ignored —
+        each backend reads its own config block so the routes stay
+        independently configurable.
         """
         from tools.tts_tool import _generate_openai_tts, _load_tts_config
 
         tts_config = _load_tts_config()
         self._load_router_config(tts_config)
 
-        is_bg = is_bulgarian(
+        category = classify_text(
             text,
             bulgarian_words=self._bg_words_override,
             min_cyrillic_chars=self._min_cyrillic,
         )
 
-        if is_bg:
+        if category in ("mlx", "edge"):
             logger.info(
-                "TTS Router: Bulgarian text detected (%d chars)", len(text),
+                "TTS Router: Bulgarian text detected (%d chars, %s)",
+                len(text), category,
             )
-            return self._generate_bg(text, output_path, format)
+            return self._generate_bg(text, output_path, format, category)
 
         logger.info(
             "TTS Router: non-Bulgarian text (%d chars), routing to OpenAI TTS",
