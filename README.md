@@ -238,6 +238,29 @@ Hugging Face Hub automatically. Subsequent calls use the local cache.
 falls back to Edge TTS** for Bulgarian text, so the plugin keeps working even
 before the model stack is fully set up.
 
+### Testing the bg-tts-v7 backend with the CLI
+
+To experiment with the transformers model in isolation (without going through
+the router), use the bundled test CLI:
+
+```bash
+~/.hermes/scripts/bg_tts_v7_cli.py "Здравейте, как сте днес?" -o out.wav
+```
+
+It shells out to the same `bg-tts` venv and synthesis logic the plugin's
+(disabled) transformers backend uses, but **does not touch routing** — it's a
+pure test harness. Options mirror the transformers config block:
+
+```bash
+~/.hermes/scripts/bg_tts_v7_cli.py "Текст" --format mp3           # mp3 output
+~/.hermes/scripts/bg_tts_v7_cli.py "Текст" --temperature 0.9      # sampling
+~/.hermes/scripts/bg_tts_v7_cli.py "Текст" --max-new-tokens 800   # length
+~/.hermes/scripts/bg_tts_v7_cli.py --help                          # all options
+```
+
+Run `--help` for the full option list (model/codec/preset overrides, dtype,
+top-p, repetition penalty, speech offset).
+
 ## Requirements
 
 - `edge-tts` Python package (for the Bulgarian route): `pip install edge-tts`
