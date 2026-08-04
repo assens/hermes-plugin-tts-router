@@ -118,8 +118,8 @@ If you used `hermes plugins install`, the scripts are in the plugin's
 `scripts/` directory. Copy them to `~/.hermes/scripts/`:
 
 ```bash
-cp ~/.hermes/plugins/tts/tts-router/scripts/bg_tts_st_server.py ~/.hermes/scripts/
-cp ~/.hermes/plugins/tts/tts-router/scripts/bg_tts_st_server.sh ~/.hermes/scripts/
+cp ~/.hermes/plugins/tts-router/scripts/bg_tts_st_server.py ~/.hermes/scripts/
+cp ~/.hermes/plugins/tts-router/scripts/bg_tts_st_server.sh ~/.hermes/scripts/
 chmod +x ~/.hermes/scripts/bg_tts_st_server.{py,sh}
 ```
 
