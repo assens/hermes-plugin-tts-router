@@ -53,8 +53,109 @@ and `bg-tts-v5-mlx` are kept in the codebase for testing but **not** routed to):
 hermes plugins install assen-sharlandjiev/hermes-plugin-tts-router --enable
 
 # Or full URL
-hermes plugins install https://github.com/assen-sharlandjiev/hermes-plugin-tts-router --enable
+hermes plugins install https://github.com/assens/hermes-plugin-tts-router --enable
 ```
+
+## Prerequisites (beyond `hermes plugins install`)
+
+The plugin install only copies the Python code — it does **not** set up the
+Python venv, model weights, or server scripts that the bg-tts-st backend needs.
+Follow these steps on a fresh Hermes instance:
+
+### 1. Create the dedicated Python ≥ 3.13 venv
+
+Hermes's own venv is Python 3.11, too old for `supertonic` and `miocodec`
+(both require ≥ 3.12). Create a separate venv:
+
+```bash
+python3.13 -m venv ~/.hermes/venvs/ani-voice
+
+env -u PYTHONPATH ~/.hermes/venvs/ani-voice/bin/pip install \
+  "supertonic==1.3.1" \
+  "bg-text-normalizer==1.1.0" \
+  "num2cyrillic==1.0.0" \
+  soundfile \
+  "onnxruntime>=1.20.0" \
+  "huggingface-hub" \
+  torch torchaudio \
+  "miocodec @ git+https://github.com/Aratako/MioCodec@main"
+```
+
+| Package | Purpose |
+|---------|---------|
+| `supertonic` | Stage 1 — voice-style reference generation (ONNX, CPU) |
+| `bg-text-normalizer` | Bulgarian text normalization (numbers, dates) |
+| `num2cyrillic` | Number → Cyrillic word conversion |
+| `torch` / `torchaudio` | Stage 2 — BgTTS synthesis (MPS on Apple Silicon) |
+| `miocodec` | Codec for BgTTS audio encoding/decoding (from git) |
+| `onnxruntime` | Supertonic ONNX inference |
+| `soundfile` | Audio I/O |
+
+### 2. Download the Ani-Voice-API model (~148 MB)
+
+```bash
+~/.hermes/venvs/ani-voice/bin/hf download \
+  beleata74/Ani-Voice-API \
+  --local-dir ~/.hermes/models/Ani-Voice-API
+```
+
+This includes the BgTTS checkpoint (`BgTTS/checkpoint_inference.pt`, 146 MB,
+step 258680), the inference source code, and demo WAVs.
+
+### 3. Auto-downloaded models (no manual step)
+
+These are fetched automatically on the **first synthesis request** (so the
+first request will be slower):
+
+- **MioCodec** (`Aratako/MioCodec-25Hz-24kHz`) — cached at
+  `~/.cache/huggingface/hub/` by `miocodec`
+- **Supertonic voice assets** — voice-style references for F1–F5, M1–M5,
+  fetched by `supertonic` on first use
+
+### 4. Install the server scripts
+
+If you used `hermes plugins install`, the scripts are in the plugin's
+`scripts/` directory. Copy them to `~/.hermes/scripts/`:
+
+```bash
+cp ~/.hermes/plugins/tts/tts-router/scripts/bg_tts_st_server.py ~/.hermes/scripts/
+cp ~/.hermes/plugins/tts/tts-router/scripts/bg_tts_st_server.sh ~/.hermes/scripts/
+chmod +x ~/.hermes/scripts/bg_tts_st_server.{py,sh}
+```
+
+The plugin auto-starts/stops the server on `port 8002` — you don't normally
+need to run it manually, but the scripts must be at `~/.hermes/scripts/`.
+
+### 5. OpenAI-compatible TTS endpoint (for English)
+
+The English route needs an OpenAI-compatible TTS server on **port 8000**. On
+this setup that's [oMLX](https://github.com/NousResearch/omlx) serving
+`Kokoro-82M-bf16`. Alternatively, point `tts.openai.base_url` at any
+OpenAI-compatible endpoint (real OpenAI API, DeepInfra, etc.).
+
+### 6. `ffplay` (for test CLIs only)
+
+The standalone evaluation CLIs (`ani_voice_cli.py`, `bg_tts_38m_cli.py`,
+`bg_tts_v7_cli.py`) play audio via `ffplay`. Not needed for the router itself:
+
+```bash
+brew install ffmpeg
+```
+
+### Quick checklist
+
+| Step | Required? | Size | Auto? |
+|------|-----------|------|-------|
+| Install plugin (`hermes plugins install`) | ✅ | small | — |
+| Create `~/.hermes/venvs/ani-voice` (Python 3.13) | ✅ | ~3 GB (torch) | Manual |
+| Download Ani-Voice-API model | ✅ | 148 MB | Manual |
+| MioCodec model | ✅ | ~200 MB | Auto (first run) |
+| Supertonic voice assets | ✅ | ~50 MB | Auto (first run) |
+| Copy server scripts to `~/.hermes/scripts/` | ✅ | small | Manual |
+| Configure `config.yaml` (see below) | ✅ | — | Manual |
+| OpenAI/Kokoro endpoint (port 8000) | For English | varies | Separate install |
+| `ffplay` (`brew install ffmpeg`) | Test CLIs only | ~100 MB | Manual |
+| Edge TTS | Fallback | 0 | Built-in |
 
 ## Configuration
 
