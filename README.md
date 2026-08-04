@@ -213,6 +213,41 @@ tts:
 After configuring, start a new session (`/new` or `/reset`) for the plugin to
 load.
 
+### Setting config via `hermes config set`
+
+Instead of editing `config.yaml` by hand, you can use the Hermes CLI (these
+set the defaults used above):
+
+```bash
+# Enable the plugin
+hermes config set plugins.enabled '["tts/tts-router"]'
+
+# Provider + Edge fallback voice
+hermes config set tts.provider tts-router
+hermes config set tts.edge.voice bg-BG-KalinaNeural
+
+# OpenAI / Kokoro endpoint (English route)
+hermes config set tts.openai.model Kokoro-82M-bf16
+hermes config set tts.openai.voice af_sky
+hermes config set tts.openai.streaming true
+hermes config set tts.openai.base_url http://127.0.0.1:8000/v1
+hermes config set tts.openai.api_key omlx-local
+hermes config set tts.openai.speed 1
+hermes config set tts.openai.response_format opus
+
+# tts-router: bg-tts-st is the single Bulgarian backend
+hermes config set tts.tts_router.bg_backend bg-tts-st
+hermes config set tts.tts_router.bg_tts_st.voice_style M5
+hermes config set tts.tts_router.bg_tts_st.speed 1.6
+hermes config set tts.tts_router.bg_tts_st.device mps
+hermes config set tts.tts_router.bg_tts_st.temperature 0.7
+hermes config set tts.tts_router.bg_tts_st.top_k 250
+hermes config set tts.tts_router.bg_tts_st.top_p 0.95
+hermes config set tts.tts_router.bg_tts_st.rep_penalty 1.1
+hermes config set tts.tts_router.bg_tts_st.max_new_tokens 512
+hermes config set tts.tts_router.bg_tts_st.server_url http://127.0.0.1:8002
+```
+
 ## Logging
 
 The plugin writes every routing decision to its own log file (independent of
